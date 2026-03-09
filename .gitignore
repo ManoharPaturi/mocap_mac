@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.so
+
+# Virtual environment
+.venv/
+.venv310/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VS Code
+.vscode/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project-specific large files
+*.db
+results/
+data/*.html
+calibration.json
+
+# MediaPipe models (large binary assets tracked per-repo)
+Motion-capture/models/
+Motion-capture-vs1/models/
