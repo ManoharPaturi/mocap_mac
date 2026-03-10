@@ -210,6 +210,7 @@ class CameraServer:
                 'camera_id': self.camera_id,
                 'frame_number': frame_number,
                 'timestamp': timestamp,
+                'landmarks': self._build_stereo_packet_landmarks(results),
                 'results': self._serialize_results(results),
                 'frame_jpeg': frame_jpeg  # JPEG-encoded frame bytes
             }
@@ -229,41 +230,56 @@ class CameraServer:
     
     def _serialize_results(self, results: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Serialize MediaPipe results to JSON-compatible format.
-        Only send landmark coordinates, not the full results object.
+        Serialize only pose_world_landmarks for Tier-3 fallback on the master.
+        2D pose landmarks are sent compactly via the 'landmarks' field.
+        Face/hand landmarks are not consumed by the master coordinator.
         """
         serialized = {}
-        
-        # Serialize pose landmarks
-        if 'pose_landmarks' in results and results['pose_landmarks']:
-            # Check if already serialized (list of dicts)
-            if isinstance(results['pose_landmarks'][0], list) and isinstance(results['pose_landmarks'][0][0], dict):
-                serialized['pose_landmarks'] = results['pose_landmarks']
-            else:
-                serialized['pose_landmarks'] = [
-                    self._serialize_landmark_list(lm_list) 
-                    for lm_list in results['pose_landmarks']
-                ]
-        
-        # Serialize pose world landmarks
-        if 'pose_world_landmarks' in results and results['pose_world_landmarks']:
-            if isinstance(results['pose_world_landmarks'][0], list) and isinstance(results['pose_world_landmarks'][0][0], dict):
-                serialized['pose_world_landmarks'] = results['pose_world_landmarks']
+
+        pose_obj = results.get('pose') if isinstance(results, dict) else None
+        if pose_obj and hasattr(pose_obj, 'pose_world_landmarks') and pose_obj.pose_world_landmarks:
+            serialized['pose_world_landmarks'] = [
+                self._serialize_landmark_list(lm_list)
+                for lm_list in pose_obj.pose_world_landmarks
+            ]
+            return serialized
+
+        # Fallback: already-serialized world landmarks
+        world = results.get('pose_world_landmarks') if isinstance(results, dict) else None
+        if world:
+            if isinstance(world[0], list) and world[0] and isinstance(world[0][0], dict):
+                serialized['pose_world_landmarks'] = world
             else:
                 serialized['pose_world_landmarks'] = [
-                    self._serialize_landmark_list(lm_list) 
-                    for lm_list in results['pose_world_landmarks']
+                    self._serialize_landmark_list(lm_list)
+                    for lm_list in world
                 ]
-        
-        # Serialize face landmarks (optional)
-        if 'face_landmarks' in results and results['face_landmarks']:
-            serialized['face_landmarks'] = results['face_landmarks']
-        
-        # Serialize hand landmarks (optional)
-        if 'hand_landmarks' in results and results['hand_landmarks']:
-            serialized['hand_landmarks'] = results['hand_landmarks']
-        
+
         return serialized
+
+    def _build_stereo_packet_landmarks(self, results: Dict[str, Any]) -> list:
+        """
+        Build compact 2D packet landmarks: [{'x','y','conf'}, ...] for 33 pose joints.
+        Falls back gracefully when pose is unavailable.
+        """
+        if not isinstance(results, dict):
+            return []
+
+        pose_obj = results.get('pose')
+        if pose_obj and hasattr(pose_obj, 'pose_landmarks'):
+            if not pose_obj.pose_landmarks or len(pose_obj.pose_landmarks) == 0:
+                return []
+            person = pose_obj.pose_landmarks[0]
+            return [
+                {
+                    'x': float(lm.x),
+                    'y': float(lm.y),
+                    'conf': float(getattr(lm, 'visibility', 1.0))
+                }
+                for lm in person
+            ]
+
+        return []
     
     def _serialize_landmark_list(self, landmark_list) -> list:
         """Convert MediaPipe landmark list to simple dict format."""
