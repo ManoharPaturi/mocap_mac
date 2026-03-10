@@ -101,6 +101,10 @@ class MocapGUI:
         self._latest_metrics = None
         self._metrics_update_pending = False
 
+        # Thread-safe UI task queue: video_loop enqueues callables; main-thread poller drains them.
+        # This is the ONLY safe way to update Tkinter widgets from a background thread.
+        self._ui_task_queue = queue.Queue(maxsize=256)
+
         # Network send queue — latest-frame only to minimize streaming latency
         self._send_queue = queue.Queue(maxsize=1)
         self._send_worker_thread = threading.Thread(target=self._send_worker, daemon=True)
@@ -146,6 +150,9 @@ class MocapGUI:
         
         # Setup GUI First (Important: Initialize vars before thread starts)
         self.setup_gui()
+
+        # Start Tkinter UI poller (fixed 15ms rate, always safe from main thread)
+        self._start_ui_poller()
         
         # Mac OpenCV fix: Start window thread before video loop
         if platform.system() == 'Darwin':  # macOS
@@ -157,43 +164,39 @@ class MocapGUI:
         self.video_thread.start()
         
     def _display_frame_tkinter(self, frame_bgr, title="Camera Feed"):
-        """Display a BGR numpy frame in a tkinter Toplevel window (main-thread safe)."""
+        """Display a BGR numpy frame in a tkinter Toplevel window (main-thread safe).
+        Reuses a single persistent ImageTk.PhotoImage via paste() to avoid allocating
+        a new Tk image object every frame — same optimisation as Mac side.
+        """
         if not PIL_AVAILABLE:
             return
         try:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             img = PILImage.fromarray(rgb)
-            photo = ImageTk.PhotoImage(image=img)
+            del rgb
 
             if self._cam_window is None or not self._cam_window.winfo_exists():
                 self._cam_window = tk.Toplevel(self.root)
                 self._cam_window.title(title)
                 self._cam_window.configure(bg='black')
-                self._cam_label = tk.Label(self._cam_window, bg='black')
+                self._cam_photo = ImageTk.PhotoImage(image=img)
+                self._cam_label = tk.Label(self._cam_window, image=self._cam_photo, bg='black')
                 self._cam_label.pack()
+            else:
+                # Reuse existing PhotoImage: paste new pixel data, no allocation
+                self._cam_photo.paste(img)
 
             self._cam_window.title(title)
-            self._cam_label.configure(image=photo)
-            self._cam_photo = photo  # prevent GC
+            del img
         except Exception as e:
             if self.frame_count % 100 == 0:
                 print(f"[Display] Frame render error: {e}")
 
-    def _flush_display_tkinter(self):
-        """Render only the latest queued frame on the Tk main thread."""
-        self._display_update_pending = False
-        frame = self._latest_display_frame
-        title = self._latest_display_title
-        if frame is not None:
-            self._display_frame_tkinter(frame, title)
-
     def _schedule_display_tkinter(self, frame_bgr, title="Camera Feed"):
-        """Queue newest frame for display; never let Tkinter callback backlog build."""
+        """Queue newest frame for display; the main-thread poller drains it at 15ms."""
         self._latest_display_frame = frame_bgr
         self._latest_display_title = title
-        if not self._display_update_pending:
-            self._display_update_pending = True
-            self.root.after(0, self._flush_display_tkinter)
+        self._display_update_pending = True
 
     def _flush_metrics_gui(self):
         """Apply latest metrics update on Tk main thread."""
@@ -205,9 +208,58 @@ class MocapGUI:
     def _schedule_metrics_gui(self, metrics):
         """Coalesce metrics updates so GUI never backlogs."""
         self._latest_metrics = metrics
-        if not self._metrics_update_pending:
-            self._metrics_update_pending = True
-            self.root.after(0, self._flush_metrics_gui)
+        self._metrics_update_pending = True
+
+    def _enqueue_ui_task(self, func, *args, **kwargs):
+        """Thread-safe: enqueue a callable to run on Tk main thread."""
+        try:
+            self._ui_task_queue.put_nowait((func, args, kwargs))
+        except queue.Full:
+            try:
+                self._ui_task_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._ui_task_queue.put_nowait((func, args, kwargs))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _start_ui_poller(self):
+        """Fixed-rate 15ms poller that drains UI tasks and flushes coalesced display/metrics updates.
+        Runs exclusively on the Tk main thread — no thread-safety issues.
+        Guaranteed to reschedule itself via try/finally so one error never kills the display.
+        """
+        def _poll():
+            try:
+                for _ in range(16):  # bound work per tick
+                    try:
+                        func, args, kwargs = self._ui_task_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        func(*args, **kwargs)
+                    except Exception:
+                        pass
+                if self._display_update_pending:
+                    try:
+                        self._display_update_pending = False
+                        frame = self._latest_display_frame
+                        title = self._latest_display_title
+                        if frame is not None:
+                            self._display_frame_tkinter(frame, title)
+                    except Exception:
+                        self._display_update_pending = False
+                if self._metrics_update_pending:
+                    try:
+                        self._flush_metrics_gui()
+                    except Exception:
+                        self._metrics_update_pending = False
+            finally:
+                if self.running:
+                    self.root.after(15, _poll)
+        self.root.after(15, _poll)
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
@@ -710,108 +762,110 @@ class MocapGUI:
                 if MULTI_CAMERA_MODE != 'master':
                     self.db.save_frame(results)
                 
-                # Update GUI safely (Throttled)
+                # Update GUI safely (Throttled) — enqueue so main thread handles it
                 if self.frame_count % 5 == 0:
-                     self.root.after(0, self.update_table_safe, results)
+                    self._enqueue_ui_task(self.update_table_safe, results)
                      
             self.frame_count += 1
 
-            # Draw FPS overlay (landmarks already drawn above before network send)
+            # Draw FPS overlay
             frame = self.visualizer.draw_fps(frame)
             fps = self.visualizer.get_fps()
-            
-            # Update FPS label
+
+            # Update FPS label via main-thread queue — never call .config() from video thread
             try:
-                self.fps_label.config(text=f"FPS: {fps:04.1f}")
-            except: pass 
-            
-            # --- DUAL CAMERA DISPLAY (Master Mode) ---
-            # Display uses CPU only — MediaPipe already uses Metal for inference.
-            # GPU tensor path was causing 3GB/s MPS memory leak (never freed per-frame tensors).
-            if MULTI_CAMERA_MODE == 'master' and self.coordinator:
-                display_width, display_height = 640, 480
-                sync_label = "WAITING"
+                self._enqueue_ui_task(self.fps_label.config, text=f"FPS: {fps:04.1f}")
+            except Exception:
+                pass
 
-                # 1. Local frame — CPU resize
-                local_display = cv2.resize(frame, (display_width, display_height))
+            # Throttle display to ~10fps (every 3rd frame) to reduce resize+render CPU load
+            if self.frame_count % 3 == 0:
+                # Display uses CPU only — MediaPipe already uses Metal for inference.
+                # GPU tensor path was causing 3GB/s MPS memory leak (never freed per-frame tensors).
+                if MULTI_CAMERA_MODE == 'master' and self.coordinator:
+                    display_width, display_height = 640, 480
+                    sync_label = "WAITING"
 
-                # 2. Remote frame — CPU JPEG decode + resize
-                remote_display = np.zeros((display_height, display_width, 3), dtype=np.uint8)
-                if 'cam_0' in self.coordinator.frame_buffers:
-                    buf = self.coordinator.frame_buffers['cam_0']
-                    if len(buf) > 0:
-                        latest = buf[-1]
-                        jpeg = latest.results.get('frame_jpeg')
-                        if jpeg:
-                            try:
-                                self._remote_decode_queue.put_nowait((jpeg, display_width, display_height))
-                            except queue.Full:
-                                try:
-                                    self._remote_decode_queue.get_nowait()
-                                except queue.Empty:
-                                    pass
+                    # 1. Local frame — CPU resize
+                    local_display = cv2.resize(frame, (display_width, display_height))
+
+                    # 2. Remote frame — CPU JPEG decode + resize
+                    remote_display = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+                    if 'cam_0' in self.coordinator.frame_buffers:
+                        buf = self.coordinator.frame_buffers['cam_0']
+                        if len(buf) > 0:
+                            latest = buf[-1]
+                            jpeg = latest.results.get('frame_jpeg')
+                            if jpeg:
                                 try:
                                     self._remote_decode_queue.put_nowait((jpeg, display_width, display_height))
                                 except queue.Full:
-                                    pass
+                                    try:
+                                        self._remote_decode_queue.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                    try:
+                                        self._remote_decode_queue.put_nowait((jpeg, display_width, display_height))
+                                    except queue.Full:
+                                        pass
 
-                        if self.remote_frame is not None:
-                            remote_display = self.remote_frame
-                            sync_label = "LIVE" if jpeg else "BUFFERED"
-                    # Debug: print every 5s when no frames arriving
-                    if self.frame_count % 150 == 0 and sync_label == "WAITING":
-                        total = sum(self.coordinator.stats['frames_received'].values())
-                        print(f"[Display] cam_0 buf size={len(buf)}, total_rx={total} — check Windows firewall (ports 6000,6001)")
+                            if self.remote_frame is not None:
+                                remote_display = self.remote_frame
+                                sync_label = "LIVE" if jpeg else "BUFFERED"
+                        # Debug: print every 5s when no frames arriving
+                        if self.frame_count % 150 == 0 and sync_label == "WAITING":
+                            total = sum(self.coordinator.stats['frames_received'].values())
+                            print(f"[Display] cam_0 buf size={len(buf)}, total_rx={total} — check Windows firewall (ports 6000,6001)")
 
-                # 3. Combine side-by-side and push to tkinter window
-                cv2.putText(local_display, f"LOCAL-MAC", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(remote_display, f"REMOTE-WIN ({sync_label})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                combined = np.hstack([local_display, remote_display])
-                self._schedule_display_tkinter(combined, "Dual Camera — Master")
-                
-                # --- DISPLAY SYNC STATUS & 3D CALC ---
-                # Check sync status and RUN 3D TRIANGULATION
-                synced_batch = self.coordinator.get_synchronized_batch()
-                
-                # DEBUG SYNC FAILURE (Conditional print)
-                if not synced_batch and self.frame_count % 30 == 0:
-                     if 'cam_0' in self.coordinator.frame_buffers and 'local_cam' in self.coordinator.frame_buffers:
-                         c0_buf = self.coordinator.frame_buffers['cam_0']
-                         lc_buf = self.coordinator.frame_buffers['local_cam']
-                         if len(c0_buf) > 0 and len(lc_buf) > 0:
-                             t_remote = c0_buf[-1].timestamp
-                             t_local = lc_buf[-1].timestamp
-                             diff_ms = abs(t_remote - t_local) / 1e6
-                             print(f"[Sync Debug] Latest Frame Delta: {diff_ms:.1f}ms (Threshold: {config.SYNC_TIME_THRESHOLD_MS}ms)")
+                    # 3. Combine side-by-side and push to tkinter window
+                    cv2.putText(local_display, f"LOCAL-MAC", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(remote_display, f"REMOTE-WIN ({sync_label})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    combined = np.hstack([local_display, remote_display])
+                    self._schedule_display_tkinter(combined, "Dual Camera — Master")
+                    del combined, local_display, remote_display
 
-                if synced_batch and len(synced_batch) >= 2:
-                    sync_label = "SYNCED ✓"
-                    
-                    # Compute 3D Pose
-                    pose_3d = self.coordinator.get_synced_3d_pose(synced_batch)
-                    
-                    # SAVE SYNCHRONIZED DATA (Master Mode Recording)
-                    if self.is_recording:
-                         pc1_res = next((f.results for f in synced_batch if f.camera_id == 'local_cam'), None)
-                         pc2_res = next((f.results for f in synced_batch if f.camera_id == 'cam_0'), None)
-                         self.db.save_synced_frame(time.time(), pc1_res, pc2_res, pose_3d)
+                    # --- DISPLAY SYNC STATUS & 3D CALC ---
+                    # Check sync status and RUN 3D TRIANGULATION
+                    synced_batch = self.coordinator.get_synchronized_batch()
 
-                    if pose_3d:
-                        if self.frame_count % 100 == 0:
-                            print(f"✅ 3D Pose Computed! {len(pose_3d.get('pose_3d',[]))} landmarks")
-                        if self.live_viz and self.live_viz.initialized:
-                             try: self.live_viz.update(pose_3d)
-                             except: pass
+                    # DEBUG SYNC FAILURE (Conditional print)
+                    if not synced_batch and self.frame_count % 30 == 0:
+                        if 'cam_0' in self.coordinator.frame_buffers and 'local_cam' in self.coordinator.frame_buffers:
+                            c0_buf = self.coordinator.frame_buffers['cam_0']
+                            lc_buf = self.coordinator.frame_buffers['local_cam']
+                            if len(c0_buf) > 0 and len(lc_buf) > 0:
+                                t_remote = c0_buf[-1].timestamp
+                                t_local = lc_buf[-1].timestamp
+                                diff_ms = abs(t_remote - t_local) / 1e6
+                                print(f"[Sync Debug] Latest Frame Delta: {diff_ms:.1f}ms (Threshold: {config.SYNC_TIME_THRESHOLD_MS}ms)")
 
-                # FINAL GPU DISPLAY (or CPU Fallback defined earlier)
-                # Note: Labels are already applied in the GPU/CPU blocks above
-            else:
-                # Single camera or server mode — show in tkinter on Mac, cv2 on Windows
-                if platform.system() == 'Darwin':
-                    _frame_copy = frame.copy()
-                    self._schedule_display_tkinter(_frame_copy, "MoCap Live Feed")
+                    if synced_batch and len(synced_batch) >= 2:
+                        sync_label = "SYNCED ✓"
+
+                        # Compute 3D Pose
+                        pose_3d = self.coordinator.get_synced_3d_pose(synced_batch)
+
+                        # SAVE SYNCHRONIZED DATA (Master Mode Recording)
+                        if self.is_recording:
+                            pc1_res = next((f.results for f in synced_batch if f.camera_id == 'local_cam'), None)
+                            pc2_res = next((f.results for f in synced_batch if f.camera_id == 'cam_0'), None)
+                            self.db.save_synced_frame(time.time(), pc1_res, pc2_res, pose_3d)
+
+                        if pose_3d:
+                            if self.frame_count % 100 == 0:
+                                print(f"✅ 3D Pose Computed! {len(pose_3d.get('pose_3d',[]))} landmarks")
+                            if self.live_viz and self.live_viz.initialized:
+                                try: self.live_viz.update(pose_3d)
+                                except: pass
+
                 else:
-                    cv2.imshow("MoCap Live Feed", frame)
+                    # Single camera or server mode — show own feed
+                    display_frame = cv2.resize(frame, (640, 480))
+                    if platform.system() == 'Darwin':
+                        self._schedule_display_tkinter(display_frame, "MoCap Live Feed")
+                    else:
+                        self._schedule_display_tkinter(display_frame, "MoCap Live Feed")
+                    del display_frame
 
             # cv2.waitKey crashes on macOS when called from a background thread
             if platform.system() != 'Darwin':

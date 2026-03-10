@@ -227,7 +227,7 @@ MASTER_IP = '10.137.227.228'  # IP address of master coordinator
 DISCOVERY_PORT = 6000        # Port for camera discovery broadcasts
 DATA_PORT = 6001             # Port for frame data transmission
 NETWORK_PROTOCOL = 'tcp'     # 'udp' (faster) or 'tcp' (reliable)
-NETWORK_JPEG_QUALITY = 30   # Lower for reduced bandwidth and lower network latency
+NETWORK_JPEG_QUALITY = 45   # Raised for better remote display quality (was 30)
 NETWORK_STREAM_WIDTH = 640  # Remote stream width for transmission only
 NETWORK_STREAM_HEIGHT = 360  # Remote stream height for transmission only
 NETWORK_FRAMERATE_LIMIT = 30 # Cap transmission to this FPS
@@ -238,7 +238,9 @@ NETWORK_FRAMERATE_LIMIT = 30 # Cap transmission to this FPS
 # tight for WiFi links where round-trip latency alone can exceed 20ms.
 SYNC_TIME_THRESHOLD_MS = 200.0
 SYNC_DYNAMIC_THRESHOLD_ENABLED = False  # Disabled — WiFi jitter makes dynamic narrowing counterproductive
-SYNC_DYNAMIC_FACTOR = 0.5               # (unused while SYNC_DYNAMIC_THRESHOLD_ENABLED = False)
+SYNC_DYNAMIC_FACTOR = 0.6               # Fraction of frame interval used for dynamic window (unused while disabled)
+SYNC_THRESHOLD_MIN_MS = 20             # Floor for dynamic sync window (ms)
+SYNC_THRESHOLD_MAX_MS = 30             # Ceiling for dynamic sync window (ms)
 FRAME_BUFFER_SIZE = 30         # ~1s of frames at 30fps — gives sync engine enough history to match
 STALE_FRAME_TIMEOUT_MS = 5000  # Drop frames only if older than 5s — tolerates WiFi jitter + clock correction lag
 

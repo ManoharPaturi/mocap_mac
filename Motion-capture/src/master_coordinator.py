@@ -23,7 +23,8 @@ from config import (
     FILTER_MIN_CUTOFF, FILTER_BETA, FILTER_D_CUTOFF,
     ENABLE_CLOCK_SYNC, CLOCK_SYNC_PORT, CLOCK_SYNC_SAMPLES,
     CLOCK_SYNC_INTERVAL_SEC, CLOCK_SYNC_RTT_OUTLIER_FACTOR,
-    SYNC_DYNAMIC_THRESHOLD_ENABLED, SYNC_DYNAMIC_FACTOR, FPS
+    SYNC_DYNAMIC_THRESHOLD_ENABLED, SYNC_DYNAMIC_FACTOR, SYNC_THRESHOLD_MIN_MS,
+    SYNC_THRESHOLD_MAX_MS, FPS
 )
 from src.stereo_calibration import StereoCalibration
 from src.triangulation import Triangulator
@@ -94,8 +95,15 @@ class MasterCoordinator:
         self.stats = {
             'frames_received': defaultdict(int),
             'frames_synced': 0,
-            'sync_failures': 0
+            'sync_failures': 0,
+            'frames_dropped_overflow': defaultdict(int),  # sequence-gap drops per camera
         }
+
+        # Per-camera frame rate tracking (used for adaptive sync threshold)
+        self.camera_frame_rates: Dict[str, float] = {}          # camera_id -> measured fps
+        self.camera_interval_samples: Dict[str, list] = defaultdict(list)  # recent arrival intervals (s)
+        self._last_frame_recv_time: Dict[str, float] = {}       # wall-clock of last arrival
+        self.last_buffer_sizes: Dict[str, int] = {}             # snapshot of buffer depths
         
         # Fusion modules (Level 1 & 2)
         self.triangulator: Optional[Triangulator] = None
@@ -231,6 +239,9 @@ class MasterCoordinator:
             'frame_buffer_sizes': {cam_id: len(buf) for cam_id, buf in self.frame_buffers.items()},
             'clock_history_sizes': {cam_id: len(hist) for cam_id, hist in self._clock_sync_history.items()},
             'latest_jpeg_cameras': list(self._latest_camera_jpeg.keys()),
+            'camera_frame_rates': dict(self.camera_frame_rates),
+            'frames_dropped_overflow': dict(self.stats['frames_dropped_overflow']),
+            'last_buffer_sizes': dict(self.last_buffer_sizes),
         }
 
     def attach_database(self, db):
@@ -457,15 +468,31 @@ class MasterCoordinator:
         if not SYNC_DYNAMIC_THRESHOLD_ENABLED:
             return int(base_ms * 1_000_000)
 
-        fps = max(float(FPS), 1.0)
-        frame_interval_ms = 1000.0 / fps
-        dynamic_ms = frame_interval_ms * float(SYNC_DYNAMIC_FACTOR)
-        effective_ms = min(base_ms, dynamic_ms)
+        # Use measured per-camera rates if available, else fall back to config FPS
+        effective_ms = self.get_effective_sync_threshold_ms()
         return int(effective_ms * 1_000_000)
 
     def get_current_sync_threshold_ms(self) -> float:
         """Expose current effective sync threshold in milliseconds."""
         return self._get_sync_threshold_ns() / 1_000_000.0
+
+    def get_effective_sync_threshold_ms(self) -> float:
+        """Compute sync threshold from the slowest camera's measured frame interval.
+
+        Falls back to the static SYNC_TIME_THRESHOLD_MS when no rate data is available
+        (startup) or when SYNC_DYNAMIC_THRESHOLD_ENABLED is False.
+        When dynamic mode is on, the result is clamped to [SYNC_THRESHOLD_MIN_MS,
+        SYNC_THRESHOLD_MAX_MS] so a janky WiFi link never shrinks the window below
+        what a single frame interval looks like on the slowest camera.
+        """
+        if not SYNC_DYNAMIC_THRESHOLD_ENABLED or not self.camera_frame_rates:
+            return float(SYNC_TIME_THRESHOLD_MS)
+        min_fps = min((fps for fps in self.camera_frame_rates.values() if fps > 0), default=None)
+        if not min_fps:
+            return float(SYNC_TIME_THRESHOLD_MS)
+        interval_ms = 1000.0 / min_fps
+        dynamic_ms = interval_ms * float(SYNC_DYNAMIC_FACTOR)
+        return max(float(SYNC_THRESHOLD_MIN_MS), min(float(SYNC_THRESHOLD_MAX_MS), dynamic_ms))
     
     def _setup_discovery_socket(self):
         """Setup ZMQ socket for receiving discovery broadcasts."""
@@ -590,7 +617,7 @@ class MasterCoordinator:
             sock = self.context.socket(zmq.REQ)
             self._apply_tcp_low_latency_opts(sock)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, 2000)  # 2s timeout per sample
+            sock.setsockopt(zmq.RCVTIMEO, 500)   # 500ms timeout per sample — failure path costs 500ms×N instead of 2000ms×N
             sock.connect(f"tcp://{camera_ip}:{CLOCK_SYNC_PORT}")
             
             try:
@@ -837,9 +864,9 @@ class MasterCoordinator:
                     if camera_id is None:
                         continue
 
-                    # Process ALL buffered frames (CONFLATE=0 keeps up to RCVHWM frames).
-                    # This fills the frame_buffer so the sync engine has real history to match.
-                    while True:
+                    # Process buffered frames — cap at 3 per poll cycle to avoid
+                    # CPU starvation of the video capture thread.
+                    for _ in range(3):
                         try:
                             raw_data = socket.recv(zmq.NOBLOCK)
                         except zmq.Again:
@@ -952,7 +979,7 @@ class MasterCoordinator:
 
         # Network latency monitoring (after receiving, before clock correction)
         recv_time_ms = time.time() * 1000.0
-        raw_latency_ms = recv_time_ms - timestamp
+        raw_latency_ms = recv_time_ms - timestamp / 1_000_000.0  # timestamp is ns → convert to ms
         if ENABLE_CLOCK_SYNC and camera_id in self.clock_offsets:
             corrected_latency_ms = raw_latency_ms + self.clock_offsets[camera_id] / 1_000_000.0
         else:
@@ -969,10 +996,26 @@ class MasterCoordinator:
             if frame_number > expected:
                 gap = frame_number - expected
                 self._sequence_gaps[camera_id] += gap
+                self.stats['frames_dropped_overflow'][camera_id] += gap
                 if self._sequence_gaps[camera_id] <= 5:  # Only warn first few
                     print(f"[Sync] {camera_id}: sequence gap detected "
                           f"(expected #{expected}, got #{frame_number}, {gap} frames dropped)")
         self._last_frame_number[camera_id] = frame_number
+
+        # Per-camera frame rate measurement (arrival-time intervals)
+        recv_wall = time.time()
+        if camera_id in self._last_frame_recv_time:
+            interval_s = recv_wall - self._last_frame_recv_time[camera_id]
+            if 0 < interval_s < 1.0:  # ignore gaps > 1s (startup, reconnect)
+                samples = self.camera_interval_samples[camera_id]
+                samples.append(interval_s)
+                if len(samples) > 30:
+                    del samples[:-30]
+                if len(samples) >= 5:
+                    avg = sum(samples) / len(samples)
+                    self.camera_frame_rates[camera_id] = 1.0 / avg if avg > 0 else 0.0
+        self._last_frame_recv_time[camera_id] = recv_wall
+        self.last_buffer_sizes[camera_id] = len(self.frame_buffers.get(camera_id, []))
 
         if packet_landmarks is not None:
             results['packet_landmarks'] = packet_landmarks
@@ -1005,7 +1048,7 @@ class MasterCoordinator:
         
         # Debug only first 3 frames
         if self.stats['frames_received'][camera_id] <= 3:
-            has_jpeg = 'frame_jpeg' in results
+            has_jpeg = bool(msg.get('frame_jpeg'))  # jpeg lives in msg, not in results
             print(f"[MasterCoordinator] Buffered frame {frame_number} from {camera_id} (JPEG: {has_jpeg})")
     
     def get_synchronized_batch(self) -> Optional[List[FrameData]]:
@@ -1028,24 +1071,23 @@ class MasterCoordinator:
             return None
         
         # --- Stale frame eviction ---
-        # Find the newest timestamp across ALL cameras
-        global_newest_ns = None
+        # Use received_at (Mac wall-clock seconds) so inter-machine clock skew
+        # (Windows vs Mac) never causes a false-stale eviction.
+        global_newest_recv = None
         for camera_id, buffer in self.frame_buffers.items():
             if len(buffer) > 0:
-                newest_ts = buffer[-1].timestamp  # deque: last element is newest
-                if global_newest_ns is None or newest_ts > global_newest_ns:
-                    global_newest_ns = newest_ts
-        
-        if global_newest_ns is not None:
-            stale_threshold_ns = STALE_FRAME_TIMEOUT_MS * 1_000_000
+                if global_newest_recv is None or buffer[-1].received_at > global_newest_recv:
+                    global_newest_recv = buffer[-1].received_at
+
+        if global_newest_recv is not None:
+            stale_threshold_s = STALE_FRAME_TIMEOUT_MS / 1000.0
             for camera_id, buffer in list(self.frame_buffers.items()):
                 if camera_id == 'local_cam':
                     continue
                 if len(buffer) > 0:
-                    newest_in_buffer = buffer[-1].timestamp
-                    age_ns = global_newest_ns - newest_in_buffer
-                    if age_ns > stale_threshold_ns:
-                        stale_ms = age_ns / 1_000_000
+                    age_s = global_newest_recv - buffer[-1].received_at
+                    if age_s > stale_threshold_s:
+                        stale_ms = age_s * 1000.0
                         if not hasattr(self, '_stale_warned'):
                             self._stale_warned = set()
                         if camera_id not in self._stale_warned:
@@ -1064,25 +1106,42 @@ class MasterCoordinator:
             if len(buffer) == 0:
                 return None  # camera is connected but has no frames yet
 
-        # Use the newest frame of the slowest (least-recently-updated) camera as the
-        # sync anchor.  The faster camera will have something close to this timestamp;
-        # the slower camera is already at its latest, so this is the best we can do.
-        newest_per_cam = {cam: buf[-1].timestamp for cam, buf in self.frame_buffers.items()}
-        reference_ts = min(newest_per_cam.values())  # anchor = slowest camera's newest frame
-
-        # For each camera find the frame with MINIMUM |delta| from the anchor.
-        # Accept the pair only if every camera's best frame is within the threshold.
-        threshold_ns = self._get_sync_threshold_ns()
+        # Choose sync comparison field based on clock correction availability.
+        #
+        # Clock sync available → use corrected nanosecond timestamps (best accuracy).
+        # Clock sync unavailable → use received_at (Mac wall-clock seconds, same reference
+        #   for both cameras).  With Windows running at ~15 fps and Mac at ~30 fps,
+        #   a Windows frame captured at time T arrives at Mac ~10-20 ms later, while the
+        #   nearest Mac frame was captured within ±33 ms of T.  Delta ≈ ≤50 ms, well
+        #   inside the 200 ms threshold — completely immune to inter-machine clock skew.
+        use_received_at = not self.clock_offsets
         synced_frames = []
 
-        for camera_id, buffer in self.frame_buffers.items():
-            best_frame = min(buffer, key=lambda f: abs(f.timestamp - reference_ts))
-            best_delta = abs(best_frame.timestamp - reference_ts)
-            if best_delta <= threshold_ns:
-                synced_frames.append(best_frame)
-            else:
-                self.stats['sync_failures'] += 1
-                return None
+        if use_received_at:
+            newest_per_cam = {cam: buf[-1].received_at for cam, buf in self.frame_buffers.items()}
+            reference = min(newest_per_cam.values())   # anchor = slowest camera (seconds)
+            threshold = self._get_sync_threshold_ns() / 1_000_000_000.0  # ns → seconds
+            for camera_id, buffer in self.frame_buffers.items():
+                best_frame = min(buffer, key=lambda f: abs(f.received_at - reference))
+                best_delta = abs(best_frame.received_at - reference)
+                if best_delta <= threshold:
+                    synced_frames.append(best_frame)
+                else:
+                    self.stats['sync_failures'] += 1
+                    return None
+        else:
+            # Clock offsets known — compare corrected nanosecond timestamps
+            newest_per_cam = {cam: buf[-1].timestamp for cam, buf in self.frame_buffers.items()}
+            reference = min(newest_per_cam.values())   # anchor = slowest camera's newest frame (ns)
+            threshold = self._get_sync_threshold_ns()  # nanoseconds
+            for camera_id, buffer in self.frame_buffers.items():
+                best_frame = min(buffer, key=lambda f: abs(f.timestamp - reference))
+                best_delta = abs(best_frame.timestamp - reference)
+                if best_delta <= threshold:
+                    synced_frames.append(best_frame)
+                else:
+                    self.stats['sync_failures'] += 1
+                    return None
 
         if len(synced_frames) == self.num_cameras:
             # Matched — consume each selected frame and all frames older than it.

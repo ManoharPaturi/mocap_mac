@@ -179,10 +179,16 @@ class MocapGUI:
 
         # Master pipeline queues: save/capture in video thread, compute/display in worker thread
         self._master_compute_queue = queue.Queue(maxsize=1)
-        self._master_result_queue = queue.Queue(maxsize=20)
+        self._master_result_queue = queue.Queue(maxsize=2)
         self._master_compute_worker_thread = threading.Thread(target=self._master_compute_worker, daemon=True)
         self._master_compute_worker_thread.start()
         self._master_last_sync_batch = None
+
+        # Async DB save queue — unbounded so no frame is ever dropped, drained by a
+        # dedicated background thread so SQLite writes never stall the capture loop.
+        self._db_save_queue = queue.Queue()
+        self._db_save_worker_thread = threading.Thread(target=self._db_save_worker, daemon=True)
+        self._db_save_worker_thread.start()
 
         # Thread-safe GUI State Caches (Initialize defaults)
         self.mirror_active = True
@@ -1249,6 +1255,31 @@ class MocapGUI:
                 if self.frame_count % 100 == 0:
                     print(f"[Display] Remote decode error: {e}")
 
+    def _db_save_worker(self):
+        """Background worker: drain the async DB save queue so SQLite writes never block the pipeline."""
+        while True:
+            try:
+                item = self._db_save_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self.running:
+                    break
+                continue
+            if item is None:
+                break
+            try:
+                op = item[0]
+                if op == 'synced':
+                    _, ts, pc1, pc2, pose_3d, synced_batch = item
+                    self.db.save_synced_frame(ts, pc1, pc2, pose_3d)
+                    if self.coordinator and hasattr(self.coordinator, 'save_frame_to_database'):
+                        self.coordinator.save_frame_to_database(synced_batch, pose_3d)
+                elif op == 'mono':
+                    _, ts, local_res, windows_res, mono_pose_3d = item
+                    self.db.save_synced_frame(ts, local_res, windows_res, mono_pose_3d)
+            except Exception as e:
+                if self.running:
+                    print(f"[DBSave] Write error: {e}")
+
     def _master_compute_worker(self):
         """Background worker: run sync/3D compute while capture thread keeps saving next frames."""
         while self.running:
@@ -1347,9 +1378,9 @@ class MocapGUI:
                     })
 
                 if self.is_recording:
-                    self.db.save_synced_frame(time.time(), pc1_res, pc2_res, pose_3d)
-                    if self.coordinator and hasattr(self.coordinator, 'save_frame_to_database'):
-                        self.coordinator.save_frame_to_database(synced_batch, pose_3d)
+                    self._db_save_queue.put_nowait(
+                        ('synced', time.time(), pc1_res, pc2_res, pose_3d, synced_batch)
+                    )
 
             elif self.is_recording:
                 # No stereo sync (remote camera disconnected/unavailable).
@@ -1377,7 +1408,9 @@ class MocapGUI:
                         win_buf = self.coordinator.frame_buffers.get(remote_camera_id)
                         if win_buf and len(win_buf) > 0:
                             windows_res = win_buf[-1].results  # latest buffered Windows frame
-                    self.db.save_synced_frame(time.time(), local_res, windows_res, mono_pose_3d)
+                    self._db_save_queue.put_nowait(
+                        ('mono', time.time(), local_res, windows_res, mono_pose_3d)
+                    )
 
                 if pose_3d:
                     self.latest_quality = self._extract_quality_metrics(pose_3d)
@@ -1563,7 +1596,7 @@ class MocapGUI:
                     frame_number=self.frame_count,
                     timestamp=timestamp,
                     results=sync_results,
-                    received_at=timestamp  # Add received_at (same as timestamp for local)
+                    received_at=time.time()  # Mac wall-clock seconds — same units as remote cam received_at
                 )
                 
                 # Add to coordinator's buffer manually
@@ -1916,6 +1949,13 @@ class MocapGUI:
             pass
         if hasattr(self, '_master_compute_worker_thread'):
             self._master_compute_worker_thread.join(timeout=2.0)
+        # Flush async DB save queue — wait up to 5 s for in-flight writes to finish
+        try:
+            self._db_save_queue.put_nowait(None)
+        except Exception:
+            pass
+        if hasattr(self, '_db_save_worker_thread'):
+            self._db_save_worker_thread.join(timeout=5.0)
         if self.camera: self.camera.release()
         if self.db: self.db.stop_recording()
         if self.network_server: self.network_server.stop()
