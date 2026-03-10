@@ -8,7 +8,11 @@ class Camera:
         self.camera_id = camera_id
         # CAP_DSHOW avoids MSMF buffering overhead on Windows, giving lower latency
         self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
-        
+
+        # Limit internal OpenCV buffer to 1 frame so we always get the latest
+        # frame rather than a stale queued one (primary fix for live-feed lag)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         # Configure Camera
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
@@ -16,6 +20,7 @@ class Camera:
         
         self.grabbed = False
         self.frame = None
+        self.frame_event = threading.Event()
         self.running = False
         self.thread = None
         
@@ -38,19 +43,25 @@ class Camera:
                 if grabbed:
                     self.grabbed = grabbed
                     self.frame = frame
+                    self.frame_event.set()
                 else:
                     self.running = False
             else:
                 self.running = False
-            time.sleep(0.005) # Slight delay to yield CPU
 
     def read(self):
         """Return the most recent frame."""
+        self.frame_event.clear()
         return self.frame if self.grabbed else None
-        
+
+    def wait_for_frame(self, timeout=0.033):
+        """Block until a new frame is available or timeout elapses."""
+        return self.frame_event.wait(timeout)
+
     def release(self):
         """Release the camera resource."""
         self.running = False
+        self.frame_event.set()  # unblock any waiting thread
         if self.thread:
             self.thread.join()
         if self.cap.isOpened():

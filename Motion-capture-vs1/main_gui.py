@@ -638,6 +638,8 @@ class MocapGUI:
 
     def video_loop(self):
         while self.running:
+            # Block until a fresh frame is captured; avoids re-processing stale frames
+            self.camera.wait_for_frame(timeout=0.033)
             frame = self.camera.read()
             if frame is None:
                 continue
