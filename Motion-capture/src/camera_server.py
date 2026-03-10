@@ -151,8 +151,8 @@ class CameraServer:
         self.data_socket = self.context.socket(zmq.PUB)
         # Allow immediate rebinding even if port is in TIME_WAIT state
         self.data_socket.setsockopt(zmq.LINGER, 0)
-        self.data_socket.setsockopt(zmq.SNDHWM, 5)       # Small buffer so Mac can match across frames
-        self.data_socket.setsockopt(zmq.CONFLATE, 0)      # Preserve all buffered frames for sync matching
+        self.data_socket.setsockopt(zmq.SNDHWM, 1)       # Keep only a tiny send queue
+        self.data_socket.setsockopt(zmq.CONFLATE, 1)     # Keep latest frame, drop stale buffered frames
         self.data_socket.bind(f"tcp://*:{DATA_PORT}")
     
     def _clock_sync_handler(self):
@@ -255,6 +255,7 @@ class CameraServer:
             return
         
         try:
+            capture_timestamp_ns = int(timestamp) if timestamp is not None else int(time.time() * 1e9)
             # Encode frame as JPEG if provided
             frame_jpeg = None
             if frame is not None:
@@ -266,38 +267,21 @@ class CameraServer:
                 if success:
                     frame_jpeg = jpeg_buffer.tobytes()
             
-            # Package frame data
-            gpu_compute = {}
-            if isinstance(results, dict):
-                inf = results.get('inference_ms')
-                if isinstance(inf, dict):
-                    pose_ms = float(inf.get('pose', 0.0))
-                    face_ms = float(inf.get('face', 0.0))
-                    hand_ms = float(inf.get('hand', 0.0))
-                    total_ms = pose_ms + face_ms + hand_ms
-                    gpu_compute = {
-                        'inference_times_ms': {
-                            'pose': pose_ms,
-                            'face': face_ms,
-                            'hand': hand_ms,
-                            'total': total_ms,
-                        },
-                        'device': 'gpu' if total_ms > 0 else 'cpu',
-                        'timestamp_ns': time.time_ns()
-                    }
-                    self.last_gpu_compute = gpu_compute
+            # Timestamp at actual send time so sender-side processing delay
+            # does not masquerade as network latency on the master.
+            send_timestamp_ns = int(time.time() * 1e9)
 
+            # Package minimal frame data for low-latency transport.
             frame_data = {
                 'type': 'frame_data',
                 'schema_version': MESSAGE_SCHEMA_VERSION,
                 'camera_id': self.camera_id,
                 'frame_number': frame_number,
-                'timestamp': timestamp,
+                'timestamp': send_timestamp_ns,
+                'capture_timestamp_ns': capture_timestamp_ns,
                 'calibration_id': CALIBRATION_ID,
                 'capture_fps': FPS,
                 'landmarks': self._build_stereo_packet_landmarks(results),
-                'results': self._serialize_results(results),
-                'gpu_compute': gpu_compute if gpu_compute else None,
                 'frame_jpeg': frame_jpeg  # JPEG-encoded frame bytes
             }
             

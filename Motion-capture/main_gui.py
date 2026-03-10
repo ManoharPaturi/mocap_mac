@@ -83,7 +83,6 @@ from src.camera import Camera
 from src.detector import MocapDetector
 from src.visualizer import Visualizer
 from src.database import MocapDB
-from src.visualizer_3d import Visualizer3D
 from src.report_generator import ReportGenerator
 from src.pose_corrector import PoseCorrector
 from src.calculations import Calculations
@@ -104,7 +103,6 @@ if MULTI_CAMERA_MODE == 'server':
 elif MULTI_CAMERA_MODE == 'master':
     from src.master_coordinator import MasterCoordinator, FrameData
     from src.triangulation import Triangulator
-    from src.live_visualizer_3d import LiveVisualizer3D
 
 class MocapGUI:
     def __init__(self):
@@ -113,7 +111,6 @@ class MocapGUI:
         self.detector = MocapDetector()
         self.visualizer = Visualizer()
         self.db = MocapDB() 
-        self.viz_3d = Visualizer3D(self.db) 
         self.reporter = ReportGenerator(self.db) 
         self.corrector = PoseCorrector() # Init Physics Engine
         
@@ -123,7 +120,6 @@ class MocapGUI:
         self.network_server = None
         self.coordinator = None
         self.triangulator = None
-        self.live_viz = None # Real-time Matplotlib Window
         self.remote_frame = None  # Buffer for remote camera frame
         self._last_remote_frame_time = None  # Wall-clock time of most recent remote JPEG (for DISCONNECTED detection)
         
@@ -145,7 +141,6 @@ class MocapGUI:
                 self.coordinator.discover_cameras_manual([REMOTE_CAMERA_IP])
                 # Triangulator with no calibration for now (will load when available)
                 self.triangulator = Triangulator(calibration=None)
-                self.live_viz = LiveVisualizer3D()
                 print(f"[GUI] Master Coordinator started - connecting to {REMOTE_CAMERA_IP}")
         
         # State
@@ -210,6 +205,16 @@ class MocapGUI:
         self.latest_local_metrics = {}
         self.latest_remote_metrics = {}
         self.latest_quality = {}
+
+        # Save-path tracing (debug): helps pinpoint where PC2/3D/KIN disappear.
+        self._save_trace_enabled = True
+        self._save_trace_every = 30
+        self._save_trace = {
+            'prequeue_synced': 0,
+            'prequeue_mono': 0,
+            'db_dequeue_synced': 0,
+            'db_dequeue_mono': 0,
+        }
         
         # Create tkinter window
         self.root = tk.Tk()
@@ -595,14 +600,6 @@ class MocapGUI:
                                       bg='#1a1a2e', fg='#00d4ff', # Cyan for Viz
                                       width=18, bd=0, relief=tk.FLAT)
         self.viz_btn.pack(pady=5)
-
-        if MULTI_CAMERA_MODE == 'master':
-             self.live_btn = tk.Button(control_frame, text="Current Live 3D",
-                                          command=self.toggle_live_3d,
-                                          font=("Arial", 12),
-                                          bg='#1a1a2e', fg='#ffa500', # Orange
-                                          width=18, bd=0, relief=tk.FLAT)
-             self.live_btn.pack(pady=5)
         
         # ── Latency Panel (Master Mode) ──
         if MULTI_CAMERA_MODE == 'master':
@@ -1084,26 +1081,14 @@ class MocapGUI:
             messagebox.showerror("Camera Setup", f"Error: {e}")
 
     def show_visualization(self):
-        """Callback to launch Session Dashboard (HTML)."""
+        """Generate static analysis report only (dashboard visualization removed)."""
         try:
-            # 1. Open Interactive Dashboard (HTML)
-            self.viz_3d.plot_latest_session()
-            
-            # 2. Generate Static Report (Images) in Background
             path = self.reporter.generate_report()
             if path:
                 messagebox.showinfo("Report Ready", f"Full analysis saved to:\n{path}")
                 
         except Exception as e:
             messagebox.showerror("Error", f"Viz failed: {e}")
-
-    def toggle_live_3d(self):
-        """Enable/Disable Live Matplotlib Window."""
-        if self.live_viz:
-             if self.live_viz.initialized:
-                 self.live_viz.close()
-             else:
-                 self.live_viz.init_plot()
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -1270,11 +1255,39 @@ class MocapGUI:
                 op = item[0]
                 if op == 'synced':
                     _, ts, pc1, pc2, pose_3d, synced_batch = item
+                    self._save_trace['db_dequeue_synced'] += 1
+                    if self._save_trace_enabled and self._save_trace['db_dequeue_synced'] % self._save_trace_every == 0:
+                        p3d_n = 0
+                        kin_n = 0
+                        pc1_ok = self._has_pose_payload(pc1)
+                        pc2_data = self._extract_pc2_pose_data(pc2)
+                        pc2_ok = len(pc2_data) > 0
+                        if isinstance(pose_3d, dict):
+                            p3d_n = len(pose_3d.get('pose_3d', {}) or {})
+                            kin = pose_3d.get('kinematics_3d', {}) or {}
+                            if isinstance(kin, dict):
+                                kin_n = len(kin.get('flat_export', {}) or {})
+                        print(
+                            f"[SaveTrace][DBDequeue][synced] n={self._save_trace['db_dequeue_synced']} "
+                            f"batch={len(synced_batch) if synced_batch else 0} "
+                            f"pc1={'Y' if pc1_ok else 'N'} pc2={'Y' if pc2_ok else 'N'} "
+                            f"pose3d_pts={p3d_n} kin_keys={kin_n} q={self._db_save_queue.qsize()}"
+                        )
                     self.db.save_synced_frame(ts, pc1, pc2, pose_3d)
                     if self.coordinator and hasattr(self.coordinator, 'save_frame_to_database'):
                         self.coordinator.save_frame_to_database(synced_batch, pose_3d)
                 elif op == 'mono':
                     _, ts, local_res, windows_res, mono_pose_3d = item
+                    self._save_trace['db_dequeue_mono'] += 1
+                    if self._save_trace_enabled and self._save_trace['db_dequeue_mono'] % self._save_trace_every == 0:
+                        p3d_n = 0
+                        if isinstance(mono_pose_3d, dict):
+                            p3d_n = len(mono_pose_3d.get('pose_3d', {}) or {})
+                        print(
+                            f"[SaveTrace][DBDequeue][mono] n={self._save_trace['db_dequeue_mono']} "
+                            f"local={'Y' if bool(local_res) else 'N'} windows={'Y' if bool(windows_res) else 'N'} "
+                            f"pose3d_pts={p3d_n} q={self._db_save_queue.qsize()}"
+                        )
                     self.db.save_synced_frame(ts, local_res, windows_res, mono_pose_3d)
             except Exception as e:
                 if self.running:
@@ -1301,7 +1314,11 @@ class MocapGUI:
                 pc2_res = None
                 if synced_batch and len(synced_batch) >= 2:
                     pc1_res = next((f.results for f in synced_batch if f.camera_id == 'local_cam'), None)
-                    pc2_res = next((f.results for f in synced_batch if f.camera_id == remote_camera_id), None)
+                    remote_frames = [f for f in synced_batch if f.camera_id != 'local_cam']
+                    if remote_frames:
+                        chosen_remote = next((f for f in remote_frames if f.camera_id == remote_camera_id), remote_frames[0])
+                        remote_camera_id = chosen_remote.camera_id
+                        pc2_res = chosen_remote.results
 
                     t_tri_start = time.perf_counter()
                     pose_3d = self.coordinator.get_synced_3d_pose(synced_batch) if self.coordinator else None
@@ -1348,9 +1365,23 @@ class MocapGUI:
                 buf = self.coordinator.frame_buffers.get(remote_camera_id)
                 if buf and len(buf) > 0:
                     pc2_res = buf[-1].results
+            if not pc2_res and self.coordinator:
+                freshest = None
+                freshest_cam = None
+                for cam_id, buf in self.coordinator.frame_buffers.items():
+                    if cam_id == 'local_cam' or len(buf) == 0:
+                        continue
+                    candidate = buf[-1]
+                    if freshest is None or candidate.received_at > freshest.received_at:
+                        freshest = candidate
+                        freshest_cam = cam_id
+                if freshest is not None:
+                    pc2_res = freshest.results
+                    remote_camera_id = freshest_cam
 
+            pc2_has_pose = self._has_pose_payload(pc2_res)
             remote_metrics_new = self._compute_stream_metrics(remote_camera_id, pc2_res) \
-                if (pc2_res and remote_camera_id) else None
+                if (pc2_has_pose and remote_camera_id) else None
             if remote_metrics_new:
                 self.latest_remote_metrics = remote_metrics_new
                 # Push updated remote metrics to GUI (coalesced)
@@ -1378,6 +1409,38 @@ class MocapGUI:
                     })
 
                 if self.is_recording:
+                    # Normalize wrapped remote payload so DB serializer always
+                    # receives compact landmark keys at top level.
+                    if isinstance(pc2_res, dict):
+                        inner = pc2_res.get('results')
+                        if isinstance(inner, dict):
+                            normalized = dict(pc2_res)
+                            if 'landmarks' not in normalized and inner.get('landmarks') is not None:
+                                normalized['landmarks'] = inner.get('landmarks')
+                            if 'packet_landmarks' not in normalized and inner.get('packet_landmarks') is not None:
+                                normalized['packet_landmarks'] = inner.get('packet_landmarks')
+                            if 'pose_landmarks' not in normalized and inner.get('pose_landmarks') is not None:
+                                normalized['pose_landmarks'] = inner.get('pose_landmarks')
+                            pc2_res = normalized
+
+                    self._save_trace['prequeue_synced'] += 1
+                    if self._save_trace_enabled and self._save_trace['prequeue_synced'] % self._save_trace_every == 0:
+                        p3d_n = 0
+                        kin_n = 0
+                        pc1_ok = self._has_pose_payload(pc1_res)
+                        pc2_data = self._extract_pc2_pose_data(pc2_res)
+                        pc2_ok = len(pc2_data) > 0
+                        if isinstance(pose_3d, dict):
+                            p3d_n = len(pose_3d.get('pose_3d', {}) or {})
+                            kin = pose_3d.get('kinematics_3d', {}) or {}
+                            if isinstance(kin, dict):
+                                kin_n = len(kin.get('flat_export', {}) or {})
+                        print(
+                            f"[SaveTrace][PreQueue][synced] n={self._save_trace['prequeue_synced']} "
+                            f"remote_id={remote_camera_id} batch={len(synced_batch)} "
+                            f"pc1={'Y' if pc1_ok else 'N'} pc2={'Y' if pc2_ok else 'N'} "
+                            f"pose3d_pts={p3d_n} kin_keys={kin_n}"
+                        )
                     self._db_save_queue.put_nowait(
                         ('synced', time.time(), pc1_res, pc2_res, pose_3d, synced_batch)
                     )
@@ -1404,10 +1467,26 @@ class MocapGUI:
                     # Also check if the Windows buffer has a recent frame: if so, save it
                     # as pc2 so Windows data is never silently discarded even when sync fails.
                     windows_res = None
-                    if remote_camera_id and self.coordinator:
-                        win_buf = self.coordinator.frame_buffers.get(remote_camera_id)
-                        if win_buf and len(win_buf) > 0:
-                            windows_res = win_buf[-1].results  # latest buffered Windows frame
+                    if self.coordinator:
+                        win_candidate = None
+                        for cam_id, buf in self.coordinator.frame_buffers.items():
+                            if cam_id == 'local_cam' or len(buf) == 0:
+                                continue
+                            candidate = buf[-1]
+                            if win_candidate is None or candidate.received_at > win_candidate.received_at:
+                                win_candidate = candidate
+                        if win_candidate is not None:
+                            windows_res = win_candidate.results  # latest non-local frame
+                    self._save_trace['prequeue_mono'] += 1
+                    if self._save_trace_enabled and self._save_trace['prequeue_mono'] % self._save_trace_every == 0:
+                        p3d_n = 0
+                        if isinstance(mono_pose_3d, dict):
+                            p3d_n = len(mono_pose_3d.get('pose_3d', {}) or {})
+                        print(
+                            f"[SaveTrace][PreQueue][mono] n={self._save_trace['prequeue_mono']} "
+                            f"remote_id={remote_camera_id} local={'Y' if bool(local_res) else 'N'} "
+                            f"windows={'Y' if bool(windows_res) else 'N'} pose3d_pts={p3d_n}"
+                        )
                     self._db_save_queue.put_nowait(
                         ('mono', time.time(), local_res, windows_res, mono_pose_3d)
                     )
@@ -1418,13 +1497,6 @@ class MocapGUI:
                         print(f"✅ 3D Pose Computed! {len(pose_3d.get('pose_3d',[]))} landmarks")
                         if self.coordinator:
                             self.coordinator._log_latency_summary()
-                    if self.live_viz and self.live_viz.initialized:
-                        # Throttle matplotlib to ~2 fps so it never blocks the compute pipeline
-                        if frame_count % 15 == 0:
-                            try:
-                                self.live_viz.update(pose_3d)
-                            except Exception:
-                                pass
 
     def _extract_metric_inputs(self, results):
         """Return (pose_lm, face_lm) as list[dict] from local or remote result formats."""
@@ -1456,8 +1528,11 @@ class MocapGUI:
 
         if not pose_lm:
             packet = results.get('packet_landmarks')
+            if packet is None:
+                packet = results.get('landmarks')
             if isinstance(packet, list):
-                for lm in packet:
+                src = packet[0] if packet and isinstance(packet[0], list) else packet
+                for lm in src:
                     if isinstance(lm, dict):
                         pose_lm.append({
                             'x': float(lm.get('x', 0.0)),
@@ -1465,6 +1540,11 @@ class MocapGUI:
                             'z': float(lm.get('z', 0.0)),
                             'v': float(lm.get('conf', lm.get('visibility', 1.0)))
                         })
+
+        if not pose_lm and isinstance(results.get('results'), dict):
+            inner_pose, _ = self._extract_metric_inputs(results.get('results'))
+            if inner_pose:
+                pose_lm = inner_pose
 
         face_obj = results.get('face')
         if face_obj and hasattr(face_obj, 'face_landmarks') and face_obj.face_landmarks:
@@ -1483,6 +1563,39 @@ class MocapGUI:
                         })
 
         return pose_lm, face_lm
+
+    def _extract_pc2_pose_data(self, pc2_res):
+        """Extract PC2 pose payload using fallback keys and normalize to list-of-people."""
+        if not isinstance(pc2_res, dict):
+            return []
+
+        # 1. Try to get the data from any of the possible keys
+        raw_pc2_data = pc2_res.get('pose_landmarks') or pc2_res.get('landmarks') or pc2_res.get('packet_landmarks') or []
+
+        # 2. Fix list nesting for compact flat payload
+        if raw_pc2_data and isinstance(raw_pc2_data, list) and len(raw_pc2_data) > 0 and isinstance(raw_pc2_data[0], dict):
+            pc2_data = [raw_pc2_data]
+        else:
+            pc2_data = raw_pc2_data
+
+        return pc2_data if isinstance(pc2_data, list) else []
+
+    def _has_pose_payload(self, results) -> bool:
+        """True when results contain at least one pose payload in any supported key format."""
+        if not isinstance(results, dict):
+            return False
+
+        pose_lm, _ = self._extract_metric_inputs(results)
+        if pose_lm:
+            return True
+
+        # Support nested transport wrappers defensively.
+        inner = results.get('results')
+        if isinstance(inner, dict):
+            pose_lm, _ = self._extract_metric_inputs(inner)
+            return bool(pose_lm)
+
+        return False
 
     def _compute_stream_metrics(self, camera_key, results):
         """Compute smoothed metrics + kinematics for a specific camera stream."""
@@ -1636,10 +1749,21 @@ class MocapGUI:
             # GPU tensor path was causing 3GB/s MPS memory leak (never freed per-frame tensors).
             if MULTI_CAMERA_MODE == 'master' and self.coordinator:
                 sync_label = "WAITING"
-                remote_camera_id = next(
-                    (cid for cid in self.coordinator.frame_buffers.keys() if cid != 'local_cam'),
-                    'cam_0'
-                )
+                # Prefer the freshest non-local camera buffer. This avoids hard-coding
+                # remote IDs (e.g., cam_0 vs cam_1) and keeps pc2_res non-empty.
+                remote_camera_id = None
+                remote_candidates = [
+                    (cid, buf[-1].received_at)
+                    for cid, buf in self.coordinator.frame_buffers.items()
+                    if cid != 'local_cam' and len(buf) > 0
+                ]
+                if remote_candidates:
+                    remote_camera_id = max(remote_candidates, key=lambda x: x[1])[0]
+                else:
+                    remote_camera_id = next(
+                        (cid for cid in self.coordinator.frame_buffers.keys() if cid != 'local_cam'),
+                        'cam_0'
+                    )
 
                 # ── Throttled visual display (~10 fps) — build/send every 3rd frame only ──
                 if ABLATION_DISABLE_DISPLAY_THROTTLE or self.frame_count % 3 == 0:
@@ -1693,7 +1817,11 @@ class MocapGUI:
                         remote_lm_list = None
                         r_res = remote_latest.results if remote_latest else {}
                         if isinstance(r_res, dict):
-                            remote_lm_list = r_res.get('pose_landmarks') or r_res.get('packet_landmarks')
+                            remote_lm_list = (
+                                r_res.get('pose_landmarks')
+                                or r_res.get('packet_landmarks')
+                                or r_res.get('landmarks')
+                            )
                         self._draw_cross_camera_landmarks(local_display, results, remote_lm_list)
 
                     # 4. Combine side-by-side and push to tkinter window
@@ -1704,7 +1832,7 @@ class MocapGUI:
                             sync_label = "DISCONNECTED"
                             remote_label_color = (0, 0, 255)  # red = lost connection
                     cv2.putText(local_display, "LOCAL-MAC", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(remote_display, f"REMOTE-WIN ({sync_label})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, remote_label_color, 2)
+                    cv2.putText(remote_display, "REMOTE-WIN", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, remote_label_color, 2)
                     combined = np.hstack([local_display, remote_display])
                     self._schedule_display_tkinter(combined, "Dual Camera — Master")
                     del combined, local_display, remote_display  # explicit free — 320×240×3×2 arrays
@@ -1789,6 +1917,28 @@ class MocapGUI:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.running = False
                     break
+
+            # Explicitly release per-frame heavy objects to keep memory flat.
+            try:
+                del local_frame_data
+            except Exception:
+                pass
+            try:
+                del sync_results
+            except Exception:
+                pass
+            try:
+                del results
+            except Exception:
+                pass
+            try:
+                del frame
+            except Exception:
+                pass
+
+            # Throttled forced GC to avoid lazy collector drift in long sessions.
+            if self.frame_count % 100 == 0:
+                gc.collect()
         
         self.cleanup()
 

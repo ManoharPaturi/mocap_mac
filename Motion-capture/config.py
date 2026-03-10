@@ -134,11 +134,10 @@ FRAME_SKIP = 0  # Process every Nth frame (0 = no skip, 1 = every other frame)
 
 # Inference Acceleration
 # Backends: 'mps' (macOS Metal via MediaPipe GPU delegate), 'gpu', 'cpu', 'auto'
-# NOTE: MPS requires frame height to be a multiple of 16 for CVPixelBuffer on Apple Silicon.
-#       detector.py now rounds resized height up to the nearest 16 to satisfy this.
-INFERENCE_BACKEND = 'mps'
+# Forced to CPU on macOS to avoid long-run MediaPipe Metal CVPixelBuffer exhaustion (-6662).
+INFERENCE_BACKEND = 'cpu'
 # Backward-compat toggle used by older code paths (kept for compatibility)
-PREFER_GPU_DELEGATE = True
+PREFER_GPU_DELEGATE = False
 
 # --- Presets ---
 # You can define presets for different scenarios
@@ -227,7 +226,7 @@ MASTER_IP = '10.137.227.228'  # IP address of master coordinator
 DISCOVERY_PORT = 6000        # Port for camera discovery broadcasts
 DATA_PORT = 6001             # Port for frame data transmission
 NETWORK_PROTOCOL = 'tcp'     # 'udp' (faster) or 'tcp' (reliable)
-NETWORK_JPEG_QUALITY = 45   # Raised for better remote display quality (was 30)
+NETWORK_JPEG_QUALITY = 35   # Keep network payload light under Wi-Fi spikes
 NETWORK_STREAM_WIDTH = 640  # Remote stream width for transmission only
 NETWORK_STREAM_HEIGHT = 360  # Remote stream height for transmission only
 NETWORK_FRAMERATE_LIMIT = 30 # Cap transmission to this FPS
@@ -236,13 +235,13 @@ NETWORK_FRAMERATE_LIMIT = 30 # Cap transmission to this FPS
 # 200ms window tolerates WiFi jitter + Windows/Mac FPS mismatch (25-35fps vs 50-60fps).
 # Dynamic narrowing is disabled: at 30fps it would shrink the window to ~16ms, far too
 # tight for WiFi links where round-trip latency alone can exceed 20ms.
-SYNC_TIME_THRESHOLD_MS = 200.0
+SYNC_TIME_THRESHOLD_MS = 300.0
 SYNC_DYNAMIC_THRESHOLD_ENABLED = False  # Disabled — WiFi jitter makes dynamic narrowing counterproductive
 SYNC_DYNAMIC_FACTOR = 0.6               # Fraction of frame interval used for dynamic window (unused while disabled)
 SYNC_THRESHOLD_MIN_MS = 20             # Floor for dynamic sync window (ms)
 SYNC_THRESHOLD_MAX_MS = 30             # Ceiling for dynamic sync window (ms)
-FRAME_BUFFER_SIZE = 30         # ~1s of frames at 30fps — gives sync engine enough history to match
-STALE_FRAME_TIMEOUT_MS = 5000  # Drop frames only if older than 5s — tolerates WiFi jitter + clock correction lag
+FRAME_BUFFER_SIZE = 4          # Small rolling window to cap RAM while still allowing nearest-frame matching
+STALE_FRAME_TIMEOUT_MS = 2500  # Keep short dropouts alive longer on laggy Wi-Fi
 
 # Calibration
 CALIBRATION_FILE = 'calibration.json'
@@ -286,6 +285,8 @@ CLOCK_SYNC_PORT = 6003               # Port for clock sync ping/pong
 CLOCK_SYNC_SAMPLES = 5              # Number of ping samples to collect per sync
 CLOCK_SYNC_INTERVAL_SEC = 10         # Re-sync every 30 seconds (0 = sync once at startup)
 CLOCK_SYNC_RTT_OUTLIER_FACTOR = 2.0  # Reject samples with RTT > factor * min_rtt
+CLOCK_SYNC_SAMPLE_TIMEOUT_MS = 1500  # Tolerate Wi-Fi spikes during ping/pong
+CLOCK_SYNC_MIN_VALID_SAMPLES = 1     # Accept coarse offset when only a few samples return
 
 # Message Format
 MESSAGE_SCHEMA_VERSION = 2           # Payload schema version for forward compatibility

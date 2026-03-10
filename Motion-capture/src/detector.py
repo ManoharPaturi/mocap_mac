@@ -15,13 +15,15 @@ from config import (
     ROI_TARGET_SIZE, ROI_SMOOTHING_ALPHA, PREFER_GPU_DELEGATE,
     INFERENCE_BACKEND,
     ABLATION_DISABLE_FRAME_RESIZE, ABLATION_DISABLE_CLAHE_DEL,
-    CUDA_ENABLED, MPS_ENABLED
+    CUDA_ENABLED, MPS_ENABLED, MULTI_CAMERA_MODE
 )
 
 class MocapDetector:
     def __init__(self):
-        self.enable_face = ENABLE_FACE_DETECTION
-        self.enable_hand = ENABLE_HAND_DETECTION
+        # Multi-camera runtime only needs pose landmarks for sync/triangulation.
+        # Keep face/hand off by default there to avoid loading extra MediaPipe models.
+        self.enable_face = ENABLE_FACE_DETECTION if MULTI_CAMERA_MODE == 'single' else False
+        self.enable_hand = ENABLE_HAND_DETECTION if MULTI_CAMERA_MODE == 'single' else False
         
         # Imaging Settings
         self.gamma = GAMMA_DEFAULT
@@ -53,17 +55,33 @@ class MocapDetector:
         # 1. Pose Landmarker
         self.pose_landmarker = self._build_pose_landmarker(pose_model_path)
 
-        # 2. Face Landmarker
-        self.face_landmarker = self._build_face_landmarker(MODEL_PATHS['FACE'])
-
-        # 3. Hand Landmarker
-        self.hand_landmarker = self._build_hand_landmarker(MODEL_PATHS['HAND'])
+        # 2/3. Face+Hand are loaded lazily only when enabled.
+        self.face_landmarker = None
+        self.hand_landmarker = None
+        if self.enable_face:
+            self.face_landmarker = self._build_face_landmarker(MODEL_PATHS['FACE'])
+        if self.enable_hand:
+            self.hand_landmarker = self._build_hand_landmarker(MODEL_PATHS['HAND'])
 
         # GPU delegate flag for hardware-specific frame handling:
         # CVPixelBuffer on Apple Silicon requires height to be a multiple of 16.
         # Clamp to actual runtime GPU availability so the flag is never True
         # when no accelerator is present (prevents -6662 kCVReturnInvalidSize).
         self.use_gpu_delegate = self.use_gpu_delegate and (CUDA_ENABLED or MPS_ENABLED)
+
+    def _ensure_gpu_safe_size(self, frame):
+        """Ensure dimensions are CVPixelBuffer-safe for MediaPipe GPU/Metal paths.
+        On macOS Metal we have observed fatal -6662 errors when frame dims are not aligned.
+        """
+        if not self.use_gpu_delegate or frame is None:
+            return frame
+        h, w = frame.shape[:2]
+        # Keep dimensions aligned for stable CVPixelBuffer allocation.
+        safe_w = max(16, ((w + 15) // 16) * 16)
+        safe_h = max(16, ((h + 15) // 16) * 16)
+        if safe_w != w or safe_h != h:
+            frame = cv2.resize(frame, (safe_w, safe_h), interpolation=cv2.INTER_AREA)
+        return frame
 
     def _should_use_gpu_delegate(self):
         backend = str(INFERENCE_BACKEND).strip().lower()
@@ -87,16 +105,8 @@ class MocapDetector:
         return bool(PREFER_GPU_DELEGATE and (CUDA_ENABLED or MPS_ENABLED))
 
     def _create_base_options(self, model_path):
-        if self.use_gpu_delegate:
-            try:
-                return python.BaseOptions(
-                    model_asset_path=model_path,
-                    delegate=python.BaseOptions.Delegate.GPU
-                )
-            except Exception as error:
-                print(f"[Detector] GPU delegate unavailable ({error}), falling back to CPU")
-                self.use_gpu_delegate = False
-
+        # Force CPU delegate path to avoid long-run Metal CVPixelBuffer leaks on macOS.
+        self.use_gpu_delegate = False
         return python.BaseOptions(model_asset_path=model_path)
 
     def _build_pose_landmarker(self, model_path):
@@ -187,8 +197,15 @@ class MocapDetector:
         """Update runtime imaging parameters."""
         self.gamma = gamma
         self.face_exposure = face_exposure
-        self.enable_face = enable_face
-        self.enable_hand = enable_hand
+        self.enable_face = bool(enable_face)
+        self.enable_hand = bool(enable_hand)
+
+        # Lazy-init optional models only when toggled on.
+        if self.enable_face and self.face_landmarker is None:
+            self.face_landmarker = self._build_face_landmarker(MODEL_PATHS['FACE'])
+        if self.enable_hand and self.hand_landmarker is None:
+            self.hand_landmarker = self._build_hand_landmarker(MODEL_PATHS['HAND'])
+
         if enable_roi is not None:
             self.enable_roi_cropping = enable_roi
 
@@ -301,6 +318,9 @@ class MocapDetector:
                 
         # Update frame reference for filters
         frame = processing_frame
+
+        # Final guard: all GPU paths (including ROI crops) must be CVPixelBuffer-safe.
+        frame = self._ensure_gpu_safe_size(frame)
             
         # 2. Gamma Correction
         if self.gamma != 1.0:
@@ -401,7 +421,7 @@ class MocapDetector:
         
         face_result = None
         t_face_ms = 0
-        if self.enable_face:
+        if self.enable_face and self.face_landmarker is not None:
             t_face_start = time.perf_counter()
             face_result = self.face_landmarker.detect_for_video(mp_image, timestamp_ms)
             t_face_ms = (time.perf_counter() - t_face_start) * 1000
@@ -418,7 +438,7 @@ class MocapDetector:
         
         hand_result = None
         t_hand_ms = 0
-        if self.enable_hand:
+        if self.enable_hand and self.hand_landmarker is not None:
             t_hand_start = time.perf_counter()
             hand_result = self.hand_landmarker.detect_for_video(mp_image, timestamp_ms)
             t_hand_ms = (time.perf_counter() - t_hand_start) * 1000

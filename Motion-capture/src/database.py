@@ -37,6 +37,9 @@ class MocapDB:
         self.current_table = None # Track current table name
         self.thread = None
         self._dropped_queue_items = 0
+        self._save_trace_enabled = True
+        self._save_trace_every = 30
+        self._save_trace_count = 0
         self._init_db()
 
     def _enqueue_data(self, data: Dict[str, Any]):
@@ -653,22 +656,86 @@ class MocapDB:
         if not self.running or not self.session_id:
             return
 
-        def process_results(results):
+        def _extract_pc2_pose_data(pc2_res):
+            if not isinstance(pc2_res, dict):
+                return []
+
+            # 1. Try to get the data from any of the possible keys
+            raw_pc2_data = pc2_res.get('pose_landmarks') or pc2_res.get('landmarks') or pc2_res.get('packet_landmarks') or []
+
+            # 2. Fix the list nesting for compact payload
+            if raw_pc2_data and isinstance(raw_pc2_data, list) and len(raw_pc2_data) > 0 and isinstance(raw_pc2_data[0], dict):
+                pc2_data = [raw_pc2_data]
+            else:
+                pc2_data = raw_pc2_data
+
+            return pc2_data if isinstance(pc2_data, list) else []
+
+        def _normalize_compact_pose_payload(results):
+            """Return pose landmarks in list-of-people shape from compact network payloads."""
+            if not isinstance(results, dict):
+                return None
+
+            packet = results.get('packet_landmarks')
+            if packet is None:
+                packet = results.get('landmarks')
+
+            # Defensive support for wrapped payloads.
+            if packet is None:
+                inner = results.get('results')
+                if isinstance(inner, dict):
+                    packet = inner.get('packet_landmarks') or inner.get('landmarks')
+
+            if not isinstance(packet, list) or len(packet) == 0:
+                return None
+
+            src = packet[0] if isinstance(packet[0], list) else packet
+            person = [
+                {
+                    'x': round(float(lm.get('x', 0.0)), 5),
+                    'y': round(float(lm.get('y', 0.0)), 5),
+                    'z': round(float(lm.get('z', 0.0)), 5),
+                    'v': round(float(lm.get('conf', lm.get('visibility', 1.0))), 5)
+                }
+                for lm in src if isinstance(lm, dict)
+            ]
+            return [person] if person else None
+
+        def _has_compact_pose_payload(results) -> bool:
+            normalized = _normalize_compact_pose_payload(results)
+            return bool(normalized and len(normalized[0]) > 0)
+
+        def process_results(results, is_pc2=False):
             if not results: return [], [], [], []
+            if isinstance(results, dict):
+                # Defensive unwrap for transport wrappers.
+                wrapped = results.get('results')
+                if isinstance(wrapped, dict):
+                    merged = dict(wrapped)
+                    for k in ('landmarks', 'packet_landmarks', 'pose_landmarks', 'pose', 'face_landmarks', 'hand_landmarks'):
+                        if k in results and k not in merged:
+                            merged[k] = results.get(k)
+                    results = merged
+
+                if is_pc2:
+                    pc2_data = _extract_pc2_pose_data(results)
+                    if pc2_data:
+                        patched = dict(results)
+                        patched['pose_landmarks'] = pc2_data
+                        results = patched
+
             # Serialize (support both local raw-object keys and remote serialized keys)
             pose = self._serialize_landmarks(results, 'pose')
             if not pose:
                 pose = self._serialize_landmarks(results, 'pose_landmarks')
-            if (not pose) and isinstance(results, dict) and isinstance(results.get('packet_landmarks'), list):
-                pose = [[
-                    {
-                        'x': round(float(lm.get('x', 0.0)), 5),
-                        'y': round(float(lm.get('y', 0.0)), 5),
-                        'z': round(float(lm.get('z', 0.0)), 5),
-                        'v': round(float(lm.get('conf', lm.get('visibility', 1.0))), 5)
-                    }
-                    for lm in results.get('packet_landmarks', []) if isinstance(lm, dict)
-                ]]
+            if not pose:
+                pose = self._serialize_landmarks(results, 'landmarks')
+            if not pose:
+                pose = self._serialize_landmarks(results, 'packet_landmarks')
+            if not pose:
+                compact_pose = _normalize_compact_pose_payload(results)
+                if compact_pose:
+                    pose = compact_pose
 
             face = self._serialize_landmarks(results, 'face')
             if not face:
@@ -691,10 +758,10 @@ class MocapDB:
             return pose, face, hand, derived
 
         # PC1
-        p1_pose, p1_face, p1_hand, p1_derived = process_results(pc1_results)
+        p1_pose, p1_face, p1_hand, p1_derived = process_results(pc1_results, is_pc2=False)
         
         # PC2
-        p2_pose, p2_face, p2_hand, p2_derived = process_results(pc2_results)
+        p2_pose, p2_face, p2_hand, p2_derived = process_results(pc2_results, is_pc2=True)
         
         # 3D
         p3d_data = []
@@ -740,6 +807,18 @@ class MocapDB:
             'kinematics_flat': kinematics_flat,
             'confidence_data': confidence_data,
         }
+
+        # Final payload trace before enqueue/insert.
+        self._save_trace_count += 1
+        if self._save_trace_enabled and self._save_trace_count % self._save_trace_every == 0:
+            # 3. Calculate people count
+            p2_people = len(_extract_pc2_pose_data(pc2_results))
+            print(
+                f"[SaveTrace][Payload] n={self._save_trace_count} "
+                f"p1_pose_people={len(p1_pose)} p2_pose_people={p2_people} "
+                f"p3d_pts={len(p3d_data)} kin_keys={len(kinematics_flat)} "
+                f"conf_keys={len(confidence_data.get('joint_confidence', {}))}"
+            )
         self._enqueue_data(data)
 
     def _serialize_landmarks(self, results, key_or_attr):
@@ -752,6 +831,14 @@ class MocapDB:
              # Fallback: key 'pose' might contain object with 'pose_landmarks'
              if not val and key_or_attr == 'pose_landmarks':
                  val = results.get('pose')
+             # Remote compact format fallback: landmarks/packet_landmarks may carry pose.
+             if (not val) and key_or_attr in ('pose', 'pose_landmarks', 'landmarks', 'packet_landmarks'):
+                 val = (
+                     results.get('pose_landmarks')
+                     or results.get('landmarks')
+                     or results.get('packet_landmarks')
+                     or results.get('pose')
+                 )
         else:
              val = getattr(results, key_or_attr, None)
 
@@ -814,6 +901,7 @@ class MocapDB:
                              'z': round(lm.get('z',0), 5)
                          }
                          if 'v' in lm: lm_dict['v'] = lm['v']
+                         elif 'conf' in lm: lm_dict['v'] = lm['conf']
                          elif 'visibility' in lm: lm_dict['v'] = lm['visibility']
                      else:
                          # MediaPipe Landmark Object

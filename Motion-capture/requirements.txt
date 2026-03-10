@@ -15,4 +15,5 @@ matplotlib
 seaborn
 scipy
 pyzmq>=25.0.0
-msgpack>=1.0.0psutil>=5.9.0       # RSS memory telemetry for ablation study
+msgpack>=1.0.0
+psutil>=5.9.0       # RSS memory telemetry for ablation study

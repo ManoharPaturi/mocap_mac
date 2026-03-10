@@ -1,6 +1,6 @@
 # Motion Capture System Architecture (Implementation-Accurate)
 
-**Version:** VS6 (10 March 2026 — post bandwidth-optimisation update)
+**Version:** VS6.3 (10 March 2026 — low-latency + persistence hardening)
 **Last Updated:** 10 March 2026  
 **Scope:** This file describes only behavior currently implemented in this repository.
 
@@ -14,6 +14,13 @@ Configured in `config.py` with `MULTI_CAMERA_MODE`:
 - `master`: local camera pipeline + remote receive + synchronization + 3D fusion
 
 This document focuses on `master` mode because that is where multi-camera architecture runs.
+
+Recent updates reflected in this version:
+- Sender/receiver ZMQ are latest-only (`SNDHWM/RCVHWM=1`, `CONFLATE=1`).
+- Windows sender now stamps packets at send-time (`timestamp`) and includes `capture_timestamp_ns` for diagnostics.
+- Remote frame ingress guard drops non-local frames when corrected latency exceeds 300ms.
+- Sync stale eviction uses a temporary runtime cap of 1500ms (`min(STALE_FRAME_TIMEOUT_MS, 1500ms)`) to reduce debug spam.
+- Compact remote landmarks (`landmarks` / `packet_landmarks`) are normalized across compute and DB persistence paths.
 
 ---
 
@@ -29,7 +36,7 @@ DATA_PORT = 6001                     ZMQ SUB ← cam_0 on DATA_PORT 6001
 CLOCK_SYNC_PORT = 6003               ClockSync REQ/REP on port 6003
 FEEDBACK_PORT = 6002                 Quality feedback SUB on port 6002
 NETWORK_PROTOCOL = 'tcp'
-ZMQ PUB SNDHWM = 5, CONFLATE = 0    ZMQ SUB RCVHWM = 5, CONFLATE = 0
+ZMQ PUB SNDHWM = 1, CONFLATE = 1    ZMQ SUB RCVHWM = 1, CONFLATE = 1
 ```
 
 ---
@@ -38,10 +45,10 @@ ZMQ PUB SNDHWM = 5, CONFLATE = 0    ZMQ SUB RCVHWM = 5, CONFLATE = 0
 
 ```
 Windows Camera → CameraServer.send_frame_data()
-      │   ZMQ PUB tcp  (SNDHWM=5, CONFLATE=0)
+      │   ZMQ PUB tcp  (SNDHWM=1, CONFLATE=1)
       ▼
 Mac _data_receiver() [background thread]
-      │   ZMQ SUB (RCVHWM=5, CONFLATE=0) — all frames received, not drain-to-latest
+      │   ZMQ SUB (RCVHWM=1, CONFLATE=1) — latest-only delivery
       ▼
 _process_frame_data()
       │   clock-offset correction → compact_results_for_sync() → frame_buffers['cam_0'] (deque maxlen=30)
@@ -77,7 +84,8 @@ Each frame sent by `CameraServer.send_frame_data()` over ZMQ PUB:
     'schema_version': MESSAGE_SCHEMA_VERSION,
     'camera_id':      self.camera_id,          # 'cam_0'
     'frame_number':   int,
-    'timestamp':      int,                     # epoch nanoseconds (time.time_ns)
+      'timestamp':      int,                     # epoch nanoseconds (send-time)
+      'capture_timestamp_ns': int,               # original capture timestamp (diagnostic)
     'calibration_id': CALIBRATION_ID,
     'capture_fps':    FPS,
     'landmarks':      [{x, y, conf}, ...],     # 33-joint compact 2D (normalized 0–1)
@@ -112,7 +120,7 @@ Each frame sent by `CameraServer.send_frame_data()` over ZMQ PUB:
 
 - Local capture is read in `main_gui.py` video loop; frame appended to `coordinator.frame_buffers['local_cam']`.
 - Remote capture arrives over ZMQ SUB in `MasterCoordinator._data_receiver()`.
-- **Drain behavior (updated March 2026):** All buffered messages are received and processed per poll cycle (CONFLATE=0). Prior to this fix, the loop drained to latest-only, losing frames needed for sync matching.
+- **Drain behavior:** With `CONFLATE=1` and `RCVHWM=1`, receiver always processes the freshest available message and avoids stale queue buildup.
 - Each buffered frame: `{camera_id, frame_number, timestamp_ns, results, received_at}`.
 - `frame_buffers` for `local_cam` and `cam_0` are **pre-registered at init** — the sync gate no longer stalls waiting for the first remote frame to create the buffer entry.
 
@@ -122,9 +130,10 @@ Each frame sent by `CameraServer.send_frame_data()` over ZMQ PUB:
 - `get_synchronized_batch()` (updated March 2026):
   - **Nearest-frame matching**: anchor = slowest camera's newest frame; each other camera contributes its frame with minimum `|delta|` from anchor. Replaces original oldest-frame anchor.
   - Accepts pair if every camera's best frame is within `SYNC_TIME_THRESHOLD_MS = 200ms`.
-  - Stale eviction: remote buffer cleared if newest frame is older than `STALE_FRAME_TIMEOUT_MS = 5000ms` relative to global newest.
+      - Stale eviction: remote buffer cleared if newest frame is older than `min(STALE_FRAME_TIMEOUT_MS, 1500ms)` relative to global newest (temporary debug cap).
 - Drop gate in `_process_frame_data()` uses explicit `is None` checks — `timestamp=0` and empty dicts are no longer dropped.
 - Network latency logged (throttled) when corrected delay > 300ms.
+- Ingress stale-drop gate (new): non-local frames are discarded before buffering when corrected latency > 300ms.
 
 ### Stage 3 — Matched Frame Pair
 
@@ -166,7 +175,7 @@ Pre-packaging: world-axis transform applied; optional 3D One-Euro filter on `x/y
 
 - Side-by-side dual view: local + latest remote JPEG.
 - Remote metrics updated from buffer even without sync.
-- Live 3D visualizer (`live_viz`) throttled to ~2fps.
+- Live 3D panel and dashboard auto-open were removed from the GUI flow.
 
 ---
 
@@ -181,7 +190,7 @@ Pre-packaging: world-axis transform applied; optional 3D One-Euro filter on `x/y
 - `SYNC_TIME_THRESHOLD_MS = 200.0` ← relaxed from 50ms (March 2026)
 - `SYNC_DYNAMIC_THRESHOLD_ENABLED = False` ← disabled; was shrinking window to ~16ms at 30fps
 - `FRAME_BUFFER_SIZE = 30` ← expanded from 2 (March 2026)
-- `STALE_FRAME_TIMEOUT_MS = 5000`
+- `STALE_FRAME_TIMEOUT_MS = 2500` (config), with runtime cap `min(config, 1500)` in sync gate
 - `TRIANGULATION_MIN_VIEWS = 2`
 - `REPROJECTION_ERROR_THRESHOLD = 15.0`
 - `STEREO_POINT_MIN_INPUT_CONFIDENCE = 0.5`
@@ -236,6 +245,7 @@ The following settings on that repo differ from what the Windows node needs:
 - Frame buffers for both cameras are pre-registered at init — sync gate does not block on first remote frame.
 - Sync and triangulation happen only when both camera streams provide matchable timestamps.
 - Fallback DB writes now include the latest Windows buffer frame when strict sync fails.
+- `pc2` payload persistence now accepts `pose_landmarks`, `landmarks`, and `packet_landmarks` with compact-list wrapping when needed.
 - ArUco stereo calibration wizard is fully wired in the GUI (`_launch_calibration_wizard`) and writes `calibration.json` with `local_cam` / `cam_0` IDs. Hot-reload via `coordinator.reload_calibration()` after save.
 
 

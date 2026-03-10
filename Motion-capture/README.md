@@ -39,40 +39,46 @@ Interpretation:
 
 ## 5) End-to-End Workflow
 
-```
-Capture (Front)
-Capture (Right)
-       │
-       ▼
-   Time Sync
-       │
-       ▼
-Matched Frame Pair
-       │
-       ▼
-  Triangulate
-       │
-       ▼
- 3D Frame Object
-       │
-       ▼
-  Kinematics
-       │
-       ▼
-    Store
-       │
-       ▼
-   Display
-```
-
-- **Capture (Front/Right):** Each camera captures frame + pose landmarks with timestamp.
-- **Time Sync:** Master aligns timestamps within `SYNC_TIME_THRESHOLD_MS`.
-- **Matched Frame Pair:** Only synchronized Front/Right frames continue to 3D.
-- **Triangulate:** Uses calibrated projection matrices and distortion compensation.
-- **3D Frame Object:** Structured fused payload for one synchronized instant (3D pose + quality metadata).
-- **Kinematics:** Computes joint velocity, acceleration, angles, and angular velocity.
-- **Store:** Persists synchronized 2D/3D and derived metrics.
-- **Display:** Renders dual view + 3D/metric outputs in GUI/dashboard.
+1. **Capture (all cameras)**
+    - Capture RGB frame
+    - Run MediaPipe pose
+    - Serialize compact packet:
+      - `camera_id`
+      - `timestamp` (epoch nanoseconds)
+      - `landmarks[33] = (x, y, conf)`
+2. **Frame synchronization (master)**
+    - Match timestamps within `SYNC_TIME_THRESHOLD_MS` (default ±20 ms)
+    - Drop unmatched frames (strict sync)
+3. **Undistortion**
+    - Convert normalized points to pixel coordinates per camera image size
+    - Undistort with camera intrinsics/distortion parameters
+4. **Triangulation**
+    - Use calibrated projection matrices `P1`, `P2` (camera A is world origin)
+    - Solve in homogeneous coordinates, convert to Euclidean `(X, Y, Z)`
+5. **Confidence filtering**
+    - Per-camera input confidence gate: `STEREO_POINT_MIN_INPUT_CONFIDENCE`
+    - Low-confidence 3D points flagged in `low_reliability_landmarks`
+6. **3D filtering**
+    - Apply 1-Euro filter to 3D positions only (`ENABLE_3D_ONE_EURO_FILTER`)
+    - Angles are computed from filtered positions (angles themselves are not filtered)
+7. **Kinematics engine**
+    - Linear velocity per joint: `(P_t - P_t-1) / dt`
+    - Linear acceleration per joint: `(V_t - V_t-1) / dt`
+    - Joint angles in degrees: `[0, 180]`
+    - Angular velocity: `(theta_t - theta_t-1) / dt`
+8. **Dashboard rendering**
+    - Live 3D skeleton in world-frame convention (+X right, +Y up, +Z forward)
+    - Angle/velocity streams and confidence metadata available in fused payload
+9. **Data logging**
+    - Per synchronized frame stores:
+      - `pose_3d`
+      - `kinematics_3d`
+      - `joint_confidence`
+      - `low_reliability_landmarks`
+10. **Validation**
+    - Static jitter test (20s)
+    - Known-angle test (e.g. 90° elbow)
+    - Known-distance test (e.g. 1m Z-depth)
 
 ## 6) Validation Protocol
 
@@ -161,11 +167,9 @@ python launch_multi_camera.py --mode server
 ```bash
 # Replace with Laptop 1's IP address
 python launch_multi_camera.py --mode master --remote-ip <SERVER_IP>
-# Alias also supported
-python launch_multi_camera.py --mode master --remote <SERVER_IP>
 ```
 
-See [docs/SETUP.md](docs/SETUP.md) for detailed multi-camera setup.
+See [SETUP.md](SETUP.md) for detailed multi-camera setup.
 
 ---
 
@@ -175,25 +179,9 @@ See [docs/SETUP.md](docs/SETUP.md) for detailed multi-camera setup.
 vs5/
 ├── config.py                  # Central configuration
 ├── main_gui.py                # Desktop GUI (Tkinter)
-├── launch_multi_camera.py     # Compatibility launcher (delegates to tools/)
+├── launch_multi_camera.py     # Multi-camera launcher
 ├── requirements.txt
-├── CHANGES.md                 # Cross-system change log (Windows/Mac sync)
-├── SYSTEM_ARCHITECTURE.md     # Implementation-accurate architecture
-│
-├── tools/                     # Utility launchers & scripts
-│   └── launch_multi_camera.py # Primary multi-camera launcher
-│
-├── docs/                      # Documentation
-│   ├── SETUP.md
-│   ├── DOCUMENTATION.md
-│   ├── IMPLEMENTATION_PROGRESS.md
-│   ├── UPDATE_NOTES.md
-│   └── COORDINATE_SYSTEM_SPEC.md
-│
-├── data/                      # Sample data & generated dashboards
-│   ├── mocap_*.csv
-│   ├── mocap_data.db
-│   └── dashboard_session_*.html
+├── SETUP.md                   # Multi-camera setup guide
 │
 ├── src/                       # Core modules
 │   ├── camera.py              # Camera capture
@@ -300,7 +288,7 @@ CameraServer         →    FrameSynchronizer
 4. **Run Master**: `python launch_multi_camera.py --mode master --remote-ip <SERVER_IP>`
 5. **Calibrate** (optional): Use checkerboard pattern for accurate 3D
 
-> See [docs/SETUP.md](docs/SETUP.md) for full step-by-step instructions.
+> See [SETUP.md](SETUP.md) for full step-by-step instructions.
 
 ### Expected Improvements
 
@@ -362,22 +350,8 @@ See `implementation_plan.md` for architecture details.
 
 ## 📚 Documentation
 
-- **Setup Guide**: [docs/SETUP.md](docs/SETUP.md) - Detailed dual-PC setup instructions
+- **Setup Guide**: [SETUP.md](SETUP.md) - Detailed dual-PC setup instructions
 - **Configuration**: [config.py](config.py) - All tunable parameters
-
-### Data Verification (Multi-Camera)
-
-After recording + CSV export, `Source` should include:
-- `PC1` (local camera on master)
-- `PC2` (remote Windows/server camera)
-- `3D` (triangulated landmarks)
-- `KIN` (flattened kinematics metrics)
-
-If `PC2` is missing in CSV, first restart both server and master processes (to ensure both run latest code), then record a new short session.
-
-### SQLite Viewer (VS Code)
-
-Install **SQLite Viewer** extension (`qwtel.sqlite-viewer`) and open `data/mocap_data.db` from Explorer.
 
 ---
 
@@ -394,6 +368,7 @@ Install **SQLite Viewer** extension (`qwtel.sqlite-viewer`) and open `data/mocap
 
 ## 🚧 Known Issues
 
+- Multi-camera GUI integration pending
 - Calibration wizard in development
 - Multi-person association across cameras needs work
 - Network latency varies with WiFi quality

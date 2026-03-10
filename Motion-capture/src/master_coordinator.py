@@ -7,7 +7,9 @@ import zmq
 import msgpack
 import json
 import time
+import os
 import platform
+import gc
 from typing import Dict, List, Optional, Any, Tuple
 from threading import Thread, Event
 from collections import defaultdict, deque
@@ -23,6 +25,7 @@ from config import (
     FILTER_MIN_CUTOFF, FILTER_BETA, FILTER_D_CUTOFF,
     ENABLE_CLOCK_SYNC, CLOCK_SYNC_PORT, CLOCK_SYNC_SAMPLES,
     CLOCK_SYNC_INTERVAL_SEC, CLOCK_SYNC_RTT_OUTLIER_FACTOR,
+    CLOCK_SYNC_SAMPLE_TIMEOUT_MS, CLOCK_SYNC_MIN_VALID_SAMPLES,
     SYNC_DYNAMIC_THRESHOLD_ENABLED, SYNC_DYNAMIC_FACTOR, SYNC_THRESHOLD_MIN_MS,
     SYNC_THRESHOLD_MAX_MS, FPS
 )
@@ -138,8 +141,10 @@ class MasterCoordinator:
         self.clock_offsets: Dict[str, int] = {}  # camera_id -> offset in nanoseconds
         self._clock_sync_history: Dict[str, List[Tuple[float, int, int]]] = defaultdict(list)
         self._clock_rtt_min_ns: Dict[str, int] = {}
+        self._passive_clock_offset_ns: Dict[str, int] = {}
         self._clock_sync_thread = None
-        self._last_sync_time = 0.0
+        self._last_sync_time = time.time()
+        self._clock_sync_failures = 0
         
         # Sequence gap detection per camera
         self._last_frame_number: Dict[str, int] = {}
@@ -173,6 +178,13 @@ class MasterCoordinator:
 
         compact: Dict[str, Any] = {}
 
+        # Normalize compact network landmarks (flat list of 33 dicts)
+        # into list-of-people shape expected by downstream serializers.
+        if 'pose_landmarks' not in results:
+            lm = results.get('landmarks')
+            if isinstance(lm, list) and lm and isinstance(lm[0], dict):
+                results['pose_landmarks'] = [lm]
+
         pose = results.get('pose')
         if pose is not None and hasattr(pose, 'pose_landmarks'):
             try:
@@ -203,7 +215,9 @@ class MasterCoordinator:
                 pass
 
         # Preserve already-serialized payloads from network paths.
-        for key in ('pose_landmarks', 'packet_landmarks', 'pose_world_landmarks', 'world_landmarks'):
+        # Include 'pose' for backward compatibility with older senders that
+        # serialize pose directly instead of pose_landmarks/packet_landmarks.
+        for key in ('pose', 'pose_landmarks', 'packet_landmarks', 'landmarks', 'pose_world_landmarks', 'world_landmarks'):
             if key in results and results.get(key) is not None and key not in compact:
                 compact[key] = results.get(key)
 
@@ -223,16 +237,21 @@ class MasterCoordinator:
         """Best-effort process + queue/buffer memory diagnostics."""
         rss_mb = None
         try:
-            if platform.system() != 'Windows':
-                import resource
-                ru = resource.getrusage(resource.RUSAGE_SELF)
-                rss_kb = float(ru.ru_maxrss)
-                if platform.system() == 'Darwin':
-                    rss_mb = rss_kb / (1024.0 * 1024.0)
-                else:
-                    rss_mb = rss_kb / 1024.0
+            # Prefer current RSS so telemetry reflects live memory, not peak maxrss.
+            psutil = __import__('psutil')
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / (1024.0 * 1024.0)
         except Exception:
-            rss_mb = None
+            try:
+                if platform.system() != 'Windows':
+                    import resource
+                    ru = resource.getrusage(resource.RUSAGE_SELF)
+                    rss_kb = float(ru.ru_maxrss)
+                    if platform.system() == 'Darwin':
+                        rss_mb = rss_kb / (1024.0 * 1024.0)
+                    else:
+                        rss_mb = rss_kb / 1024.0
+            except Exception:
+                rss_mb = None
 
         return {
             'rss_mb': float(rss_mb) if rss_mb is not None else None,
@@ -267,7 +286,16 @@ class MasterCoordinator:
 
             # Layer 1: raw 2D landmarks per camera
             for frame in synced_frames:
-                raw_lms = self._extract_pose_landmarks(frame.results) or []
+                frame_results = frame.results if isinstance(frame.results, dict) else {}
+                inner = frame_results.get('results') if isinstance(frame_results, dict) else None
+                if isinstance(inner, dict):
+                    # Merge wrapped payload with top-level compact keys.
+                    merged = dict(inner)
+                    for k in ('landmarks', 'packet_landmarks', 'pose_landmarks', 'pose'):
+                        if k in frame_results and k not in merged:
+                            merged[k] = frame_results.get(k)
+                    frame_results = merged
+                raw_lms = self._extract_pose_landmarks(frame_results) or []
                 self.db.save_raw_landmarks(frame_id, frame.camera_id, raw_lms, timestamp_ms)
 
             # Layer 2: 3D joints
@@ -617,7 +645,7 @@ class MasterCoordinator:
             sock = self.context.socket(zmq.REQ)
             self._apply_tcp_low_latency_opts(sock)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, 500)   # 500ms timeout per sample — failure path costs 500ms×N instead of 2000ms×N
+            sock.setsockopt(zmq.RCVTIMEO, int(CLOCK_SYNC_SAMPLE_TIMEOUT_MS))
             sock.connect(f"tcp://{camera_ip}:{CLOCK_SYNC_PORT}")
             
             try:
@@ -649,6 +677,11 @@ class MasterCoordinator:
                 sock.close()
         
         if not samples:
+            passive = self._passive_clock_offset_ns.get(camera_id)
+            if passive is not None:
+                print(f"[ClockSync] No valid samples for {camera_id}; using passive offset "
+                      f"{passive / 1_000_000:+.2f} ms")
+                return int(passive)
             print(f"[ClockSync] No valid samples for {camera_id}")
             return None
         
@@ -660,8 +693,11 @@ class MasterCoordinator:
         if not good_samples:
             good_samples = samples  # Fallback: use all if filter is too strict
         
-        # Use median offset for robustness
-        offsets = [s[1] for s in good_samples]
+        # Accept slightly noisy Wi-Fi by requiring only a small number of valid samples.
+        selected = good_samples if len(good_samples) >= int(CLOCK_SYNC_MIN_VALID_SAMPLES) else samples
+
+        # Use median offset for robustness.
+        offsets = [s[1] for s in selected]
         median_offset = int(statistics.median(offsets))
         
         offset_ms = median_offset / 1_000_000
@@ -671,7 +707,7 @@ class MasterCoordinator:
         if len(self._clock_sync_history[camera_id]) > 120:
             self._clock_sync_history[camera_id] = self._clock_sync_history[camera_id][-60:]
         print(f"[ClockSync] {camera_id}: offset = {offset_ms:+.2f} ms "
-              f"(RTT min = {min_rtt_ms:.2f} ms, {len(good_samples)}/{len(samples)} samples used)")
+              f"(RTT min = {min_rtt_ms:.2f} ms, {len(selected)}/{len(samples)} samples used)")
         
         return median_offset
     
@@ -696,8 +732,10 @@ class MasterCoordinator:
         self._last_sync_time = time.time()
         
         if self.clock_offsets:
+            self._clock_sync_failures = 0
             print(f"[ClockSync] Synchronization complete. {len(self.clock_offsets)} camera(s) corrected.")
         else:
+            self._clock_sync_failures += 1
             print(f"[ClockSync] No cameras synchronized. Falling back to raw timestamps.")
     
     def _check_sync_quality(self, synced_frames: List) -> Dict[str, float]:
@@ -745,8 +783,9 @@ class MasterCoordinator:
         if not ENABLE_CLOCK_SYNC or CLOCK_SYNC_INTERVAL_SEC <= 0:
             return False
         
+        interval = CLOCK_SYNC_INTERVAL_SEC * min(6, max(1, self._clock_sync_failures + 1))
         elapsed = time.time() - self._last_sync_time
-        if elapsed < CLOCK_SYNC_INTERVAL_SEC:
+        if elapsed < interval:
             return False
         
         print(f"[ClockSync] Periodic re-sync triggered ({elapsed:.0f}s since last sync)")
@@ -820,8 +859,8 @@ class MasterCoordinator:
             self._apply_tcp_low_latency_opts(socket)
             socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1s receive timeout
             socket.setsockopt(zmq.LINGER, 0)        # Don't block on close
-            socket.setsockopt(zmq.RCVHWM, 5)        # Small buffer so frames survive brief Mac lag
-            socket.setsockopt(zmq.CONFLATE, 0)       # Preserve all buffered frames for sync matching
+            socket.setsockopt(zmq.RCVHWM, 1)        # Keep only a tiny receive queue
+            socket.setsockopt(zmq.CONFLATE, 1)      # Keep latest frame, drop stale buffered frames
             socket.connect(f"tcp://{ip}:{port}")
             socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all topics
             # ZMQ slow joiner fix: give the SUB socket time to stabilize
@@ -864,9 +903,9 @@ class MasterCoordinator:
                     if camera_id is None:
                         continue
 
-                    # Process buffered frames — cap at 3 per poll cycle to avoid
-                    # CPU starvation of the video capture thread.
-                    for _ in range(3):
+                    # With CONFLATE=1 there is at most one latest frame pending.
+                    # Keep loop structure tolerant if socket options are changed later.
+                    for _ in range(2):
                         try:
                             raw_data = socket.recv(zmq.NOBLOCK)
                         except zmq.Again:
@@ -883,6 +922,19 @@ class MasterCoordinator:
 
                         if msg.get('type') == 'frame_data':
                             self._process_frame_data(msg)
+
+                        # Explicitly release per-message objects in hot receive loop.
+                        try:
+                            del msg
+                        except Exception:
+                            pass
+                        try:
+                            del raw_data
+                        except Exception:
+                            pass
+
+                        if msg_count % 100 == 0:
+                            gc.collect()
 
                 # Periodic heartbeat log every 5 seconds
                 now = time.time()
@@ -961,8 +1013,24 @@ class MasterCoordinator:
         camera_id = msg.get('camera_id')
         frame_number = msg.get('frame_number')
         timestamp = msg.get('timestamp')
-        results = msg.get('results')
+        results = msg.get('results') or {}
+        if not isinstance(results, dict):
+            results = {}
+
+        # Accept compact landmarks from both legacy and new payload layouts.
+        # Some senders place landmarks at message root, others inside results.
         packet_landmarks = msg.get('landmarks')
+        if packet_landmarks is None:
+            packet_landmarks = msg.get('packet_landmarks')
+        if packet_landmarks is None and isinstance(results, dict):
+            packet_landmarks = results.get('landmarks')
+        if packet_landmarks is None and isinstance(results, dict):
+            packet_landmarks = results.get('packet_landmarks')
+
+        # Some senders provide pose landmarks directly at root-level.
+        root_pose_landmarks = msg.get('pose_landmarks')
+        if root_pose_landmarks is not None and 'pose_landmarks' not in results:
+            results['pose_landmarks'] = root_pose_landmarks
         
         # Schema version check
         schema_ver = msg.get('schema_version', 1)
@@ -972,7 +1040,7 @@ class MasterCoordinator:
         # Allow empty results dict (no detection) - still valid for sync.
         # Use explicit None checks instead of truthiness so timestamp=0 or
         # empty-string camera_id don't silently drop valid frames.
-        if camera_id is None or frame_number is None or timestamp is None or results is None:
+        if camera_id is None or frame_number is None or timestamp is None:
             if self.stats['frames_received'].get(camera_id, 0) < 3:
                 print(f"[MasterCoordinator] Skipping invalid frame from {camera_id}")
             return
@@ -980,6 +1048,13 @@ class MasterCoordinator:
         # Network latency monitoring (after receiving, before clock correction)
         recv_time_ms = time.time() * 1000.0
         raw_latency_ms = recv_time_ms - timestamp / 1_000_000.0  # timestamp is ns → convert to ms
+        # Passive coarse offset: recv_time - remote_capture_time (includes one-way network delay).
+        # Using running minimum gives a usable fallback when REQ/REP clock sync fails.
+        arrival_delta_ns = max(0, int(t_recv - int(timestamp)))
+        prev = self._passive_clock_offset_ns.get(camera_id)
+        if prev is None or arrival_delta_ns < prev:
+            self._passive_clock_offset_ns[camera_id] = arrival_delta_ns
+
         if ENABLE_CLOCK_SYNC and camera_id in self.clock_offsets:
             corrected_latency_ms = raw_latency_ms + self.clock_offsets[camera_id] / 1_000_000.0
         else:
@@ -989,6 +1064,21 @@ class MasterCoordinator:
             if frames_seen % 30 == 0:  # throttle: log once per ~1s at 30fps
                 print(f"[Latency] ⚠️  {camera_id}: {corrected_latency_ms:.0f}ms network delay "
                       f"(raw={raw_latency_ms:.0f}ms)")
+
+        # Low-latency priority: never enqueue very stale remote frames.
+        # This prevents old capture timestamps from breaking sync matching.
+        ingress_stale_ms = 300.0
+        if camera_id != 'local_cam' and corrected_latency_ms > ingress_stale_ms:
+            self.stats['frames_dropped_overflow'][camera_id] += 1
+            if not hasattr(self, '_ingress_stale_drop_count'):
+                self._ingress_stale_drop_count = defaultdict(int)
+            self._ingress_stale_drop_count[camera_id] += 1
+            if self._ingress_stale_drop_count[camera_id] % 30 == 0:
+                print(
+                    f"[IngressDrop] {camera_id}: dropped stale frame #{frame_number} "
+                    f"lat={corrected_latency_ms:.0f}ms (> {ingress_stale_ms:.0f}ms)"
+                )
+            return
 
         # Sequence gap detection
         if camera_id in self._last_frame_number:
@@ -1019,6 +1109,14 @@ class MasterCoordinator:
 
         if packet_landmarks is not None:
             results['packet_landmarks'] = packet_landmarks
+            results['landmarks'] = packet_landmarks
+            # Downstream DB serializers and metrics treat pose landmarks as
+            # list-of-people. Wrap compact flat payload as one person.
+            if 'pose_landmarks' not in results:
+                if isinstance(packet_landmarks, list) and packet_landmarks and isinstance(packet_landmarks[0], dict):
+                    results['pose_landmarks'] = [packet_landmarks]
+                elif isinstance(packet_landmarks, list) and packet_landmarks and isinstance(packet_landmarks[0], list):
+                    results['pose_landmarks'] = packet_landmarks
 
         gpu_compute = msg.get('gpu_compute')
         if isinstance(gpu_compute, dict):
@@ -1041,6 +1139,9 @@ class MasterCoordinator:
         # Apply clock offset correction if available
         if ENABLE_CLOCK_SYNC and camera_id in self.clock_offsets:
             frame_data.timestamp = timestamp + self.clock_offsets[camera_id]
+        elif camera_id in self._passive_clock_offset_ns:
+            # Coarse fallback if explicit clock sync is unavailable.
+            frame_data.timestamp = timestamp + self._passive_clock_offset_ns[camera_id]
         
         # Add to buffer
         self.frame_buffers[camera_id].append(frame_data)
@@ -1080,7 +1181,10 @@ class MasterCoordinator:
                     global_newest_recv = buffer[-1].received_at
 
         if global_newest_recv is not None:
-            stale_threshold_s = STALE_FRAME_TIMEOUT_MS / 1000.0
+            # Hard cap stale eviction to 300ms to prioritize low latency over
+            # frame completeness when network jitter/backlog occurs.
+            stale_timeout_ms = min(float(STALE_FRAME_TIMEOUT_MS), 300.0)
+            stale_threshold_s = stale_timeout_ms / 1000.0
             for camera_id, buffer in list(self.frame_buffers.items()):
                 if camera_id == 'local_cam':
                     continue
@@ -1090,6 +1194,9 @@ class MasterCoordinator:
                         stale_ms = age_s * 1000.0
                         if not hasattr(self, '_stale_warned'):
                             self._stale_warned = set()
+                        # One-line, throttled debug signal for aggressive stale-drop mode.
+                        if camera_id not in self._stale_warned and float(STALE_FRAME_TIMEOUT_MS) > 300.0:
+                            print(f"[SyncDebug] 300ms stale-cap active (config={float(STALE_FRAME_TIMEOUT_MS):.0f}ms) -> evicting stale {camera_id} frames")
                         if camera_id not in self._stale_warned:
                             print(f"[Sync] ⚠️  {camera_id} stale by {stale_ms:.0f}ms — "
                                   f"clearing {len(buffer)} buffered frames")
@@ -1114,7 +1221,16 @@ class MasterCoordinator:
         #   a Windows frame captured at time T arrives at Mac ~10-20 ms later, while the
         #   nearest Mac frame was captured within ±33 ms of T.  Delta ≈ ≤50 ms, well
         #   inside the 200 ms threshold — completely immune to inter-machine clock skew.
-        use_received_at = not self.clock_offsets
+        # Use timestamp-domain matching when each non-local camera has either
+        # explicit clock sync or a passive coarse offset estimate.
+        can_use_timestamps = True
+        for cam_id in self.frame_buffers.keys():
+            if cam_id == 'local_cam':
+                continue
+            if cam_id not in self.clock_offsets and cam_id not in self._passive_clock_offset_ns:
+                can_use_timestamps = False
+                break
+        use_received_at = not can_use_timestamps
         synced_frames = []
 
         if use_received_at:
@@ -1122,7 +1238,10 @@ class MasterCoordinator:
             reference = min(newest_per_cam.values())   # anchor = slowest camera (seconds)
             threshold = self._get_sync_threshold_ns() / 1_000_000_000.0  # ns → seconds
             for camera_id, buffer in self.frame_buffers.items():
-                best_frame = min(buffer, key=lambda f: abs(f.received_at - reference))
+                # Prefer freshest samples with low-latency queue settings.
+                # Tail-only matching avoids selecting older frames lingering in short buffers.
+                candidates = list(buffer)[-2:] if len(buffer) > 2 else list(buffer)
+                best_frame = min(candidates, key=lambda f: abs(f.received_at - reference))
                 best_delta = abs(best_frame.received_at - reference)
                 if best_delta <= threshold:
                     synced_frames.append(best_frame)
@@ -1135,7 +1254,8 @@ class MasterCoordinator:
             reference = min(newest_per_cam.values())   # anchor = slowest camera's newest frame (ns)
             threshold = self._get_sync_threshold_ns()  # nanoseconds
             for camera_id, buffer in self.frame_buffers.items():
-                best_frame = min(buffer, key=lambda f: abs(f.timestamp - reference))
+                candidates = list(buffer)[-2:] if len(buffer) > 2 else list(buffer)
+                best_frame = min(candidates, key=lambda f: abs(f.timestamp - reference))
                 best_delta = abs(best_frame.timestamp - reference)
                 if best_delta <= threshold:
                     synced_frames.append(best_frame)
@@ -1168,7 +1288,10 @@ class MasterCoordinator:
         pose = results.get('pose')
         if not pose:
             packet_landmarks = results.get('packet_landmarks')
+            if packet_landmarks is None:
+                packet_landmarks = results.get('landmarks')
             if isinstance(packet_landmarks, list) and len(packet_landmarks) > 0:
+                src = packet_landmarks[0] if isinstance(packet_landmarks[0], list) else packet_landmarks
                 return [
                     {
                         'x': lm.get('x', 0.0),
@@ -1176,7 +1299,7 @@ class MasterCoordinator:
                         'z': lm.get('z', 0.0),
                         'visibility': lm.get('conf', lm.get('visibility', 1.0))
                     }
-                    for lm in packet_landmarks if isinstance(lm, dict)
+                    for lm in src if isinstance(lm, dict)
                 ]
             return None
 
@@ -1217,7 +1340,10 @@ class MasterCoordinator:
                     return first  # pose_landmarks[0] = person 0's landmarks
 
         packet_landmarks = results.get('packet_landmarks')
+        if packet_landmarks is None:
+            packet_landmarks = results.get('landmarks')
         if isinstance(packet_landmarks, list) and len(packet_landmarks) > 0:
+            src = packet_landmarks[0] if isinstance(packet_landmarks[0], list) else packet_landmarks
             return [
                 {
                     'x': lm.get('x', 0.0),
@@ -1225,7 +1351,7 @@ class MasterCoordinator:
                     'z': lm.get('z', 0.0),
                     'visibility': lm.get('conf', lm.get('visibility', 1.0))
                 }
-                for lm in packet_landmarks if isinstance(lm, dict)
+                for lm in src if isinstance(lm, dict)
             ]
 
         return None
