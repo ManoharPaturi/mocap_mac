@@ -1,4 +1,5 @@
 import cv2
+import sys
 import threading
 import time
 from config import CAMERA_ID, FRAME_WIDTH, FRAME_HEIGHT, FPS
@@ -6,8 +7,16 @@ from config import CAMERA_ID, FRAME_WIDTH, FRAME_HEIGHT, FPS
 class Camera:
     def __init__(self, camera_id=CAMERA_ID):
         self.camera_id = camera_id
-        self.cap = cv2.VideoCapture(camera_id)
+        # On Windows use DirectShow to avoid MSMF multi-frame buffering overhead
+        if sys.platform == 'win32':
+            self.cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(camera_id)
         
+        # Limit internal OpenCV buffer to 1 frame so we always get the latest
+        # frame rather than a stale queued one (primary fix for live-feed lag)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         # Configure Camera
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)

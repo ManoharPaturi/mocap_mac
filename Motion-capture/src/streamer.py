@@ -44,6 +44,8 @@ class VideoStreamer:
 
     def _process_loop(self):
         while self.running and self.camera.is_opened():
+            # Block until a fresh frame is captured; avoids re-processing stale frames
+            self.camera.wait_for_frame()
             frame = self.camera.read()
             if frame is None:
                 continue
