@@ -129,6 +129,8 @@ class MocapGUI:
         self.prev_lm = []
         self.prev_metrics = {}
         self.prev_time = None
+        self.latest_local_metrics = {}
+        self.latest_remote_metrics = {}
         
         # Create tkinter window
         self.root = tk.Tk()
@@ -355,8 +357,8 @@ class MocapGUI:
         cols = ("Time", "Angle_L_Shoulder", "Angle_R_Shoulder", "Angle_L_Elbow", "Angle_R_Elbow", "Angle_L_Knee", "Angle_R_Knee", "Vel_Elbow", "Vel_Wrist")
         self.tree = ttk.Treeview(parent, columns=cols, show='headings', height=8)
         
-        self.tree.heading("Time", text="Time")
-        self.tree.column("Time", width=60, anchor=tk.CENTER)
+        self.tree.heading("Time", text="Source")
+        self.tree.column("Time", width=100, anchor=tk.CENTER)
         
         headers = ["L Shldr", "R Shldr", "L Elbow", "R Elbow", "L Knee", "R Knee", "V Elb", "V Wri"]
         for col, title in zip(cols[1:], headers):
@@ -391,8 +393,11 @@ class MocapGUI:
             # Label
             tk.Label(metrics_frame, text=label_text, bg='#0f0f1e', fg='#e0e0e0', font=("Arial", 10)).grid(row=row, column=col*2, padx=10, pady=5, sticky="e")
             
-            # Value
-            val_label = tk.Label(metrics_frame, text="0.0", bg='#0f0f1e', fg='#00ff88', font=("Courier", 12, "bold"))
+            # Value — wider in master mode to fit "W:xxx.xx° | M:xxx.xx°"
+            val_font = ("Courier", 9, "bold") if MULTI_CAMERA_MODE == 'master' else ("Courier", 12, "bold")
+            val_width = 22 if MULTI_CAMERA_MODE == 'master' else 8
+            val_label = tk.Label(metrics_frame, text="--", bg='#0f0f1e', fg='#00ff88',
+                                 font=val_font, width=val_width, anchor='w')
             val_label.grid(row=row, column=col*2+1, padx=10, pady=5, sticky="w")
             
             # Save widget and unit for updating
@@ -694,9 +699,13 @@ class MocapGUI:
                     self.prev_lm = lm_list
                     self.prev_metrics = metrics
                     self.prev_time = now
+                    self.latest_local_metrics = metrics
 
                     if self.frame_count % 2 == 0:
-                        self._schedule_metrics_gui(metrics)
+                        self._schedule_metrics_gui({
+                            'local': self.latest_local_metrics,
+                            'remote': self.latest_remote_metrics
+                        })
                 except: pass
             # -------------------------
             
@@ -764,7 +773,10 @@ class MocapGUI:
                 
                 # Update GUI safely (Throttled) — enqueue so main thread handles it
                 if self.frame_count % 5 == 0:
-                    self._enqueue_ui_task(self.update_table_safe, results)
+                    self._enqueue_ui_task(self.update_table_safe, {
+                        'local': self.latest_local_metrics,
+                        'remote': self.latest_remote_metrics
+                    })
                      
             self.frame_count += 1
 
@@ -875,44 +887,38 @@ class MocapGUI:
         
         self.cleanup()
 
-    def update_table_safe(self, results):
-        # Update Table with Key Angles (Matches Headers)
-        row_values = ["-"] * 8 
-        
-        if results.get('pose') and results.get('pose').pose_landmarks:
+    def update_table_safe(self, data):
+        # Accept {'local': metrics, 'remote': metrics} dict OR legacy raw MediaPipe results
+        local_metrics = {}
+        remote_metrics = {}
+        if isinstance(data, dict) and ('local' in data or 'remote' in data):
+            local_metrics = data.get('local') or {}
+            remote_metrics = data.get('remote') or {}
+        else:
+            # Fallback: legacy call with raw results — use cached prev_metrics
+            local_metrics = self.prev_metrics
+
+        keys = ["Angle_Shoulder_L", "Angle_Shoulder_R",
+                "Angle_Elbow_L", "Angle_Elbow_R",
+                "Angle_Knee_L", "Angle_Knee_R",
+                "Velocity_Angle_Elbow_R", "Velocity_Wrist_R"]
+
+        def _insert_row(source_tag, metrics):
+            row_values = ["-"] * 8
+            for i, key in enumerate(keys):
+                if key in metrics:
+                    row_values[i] = f"{metrics[key]:.1f}"
+            ts = time.strftime("%H:%M:%S")
             try:
-                # Prioritize World Landmarks for Physics/Metrics (Meters)
-                if results.get('pose').pose_world_landmarks:
-                     plm = results.get('pose').pose_world_landmarks[0]
-                else:
-                     plm = results.get('pose').pose_landmarks[0]
-                     
-                lm_list = [{'x': lm.x, 'y': lm.y, 'z': lm.z, 'v': lm.visibility} for lm in plm]
-                # Note: Metrics are calculated in video_loop and passed via self.latest_metrics or similar mechanism usually.
-                # However, here we are recalculating or need access to the *latest* metrics which contains velocity.
-                # Since video_loop calls update_metrics_gui with full metrics, but update_table_safe only gets 'results' (Pose),
-                # we are missing the 'kinematics' which depends on state.
-                # Accessing self.prev_metrics is the best way since video_loop updates it before calling this (mostly).
-                # Actually, video_loop calls update_metrics_gui, then saves frame, then calls update_table_safe.
-                # So self.prev_metrics should have the LATEST calculation including kinematics.
-                metrics = self.prev_metrics 
-                
-                # Headers: ["L Shldr", "R Shldr", "L Elbow", "R Elbow", "L Knee", "R Knee", "V Elb", "V Wri"]
-                keys = ["Angle_Shoulder_L", "Angle_Shoulder_R", 
-                        "Angle_Elbow_L", "Angle_Elbow_R", 
-                        "Angle_Knee_L", "Angle_Knee_R",
-                        "Velocity_Angle_Elbow_R", "Velocity_Wrist_R"]
+                self.tree.insert("", 0, values=(f"{source_tag} {ts}", *row_values))
+            except Exception:
+                pass
 
-                for i, key in enumerate(keys):
-                    if key in metrics:
-                        row_values[i] = f"{metrics[key]:.1f}"
-            except: pass
+        if local_metrics:
+            _insert_row("WIN", local_metrics)
+        if remote_metrics:
+            _insert_row("MAC", remote_metrics)
 
-        ts = time.strftime("%H:%M:%S")
-        try:
-            self.tree.insert("", 0, values=(ts, *row_values))
-        except: pass
-        
         children = self.tree.get_children()
         if len(children) > 10:
             self.tree.delete(children[-1])
@@ -950,14 +956,23 @@ class MocapGUI:
         if self.root: self.root.quit()
 
     def update_metrics_gui(self, metrics):
-        """Update angle labels with latest metrics."""
+        """Update angle labels — shows W: | M: dual format in master mode."""
+        local_metrics = metrics
+        remote_metrics = {}
+        if isinstance(metrics, dict) and ('local' in metrics or 'remote' in metrics):
+            local_metrics = metrics.get('local') or {}
+            remote_metrics = metrics.get('remote') or {}
+
         for key, (label_widget, unit) in self.angle_labels.items():
-            if key in metrics:
-                val = metrics[key]
-                # angles are usually > 1, lengths are 0-1 (normalized)
-                # But lengths from calculations are Euclidean distance of normalized coords.
-                # Let's show 2 decimal places for better precision.
-                label_widget.config(text=f"{val:.2f}{unit}")
+            local_val = local_metrics.get(key) if isinstance(local_metrics, dict) else None
+            remote_val = remote_metrics.get(key) if isinstance(remote_metrics, dict) else None
+
+            if MULTI_CAMERA_MODE == 'master':
+                local_txt = f"{local_val:.2f}{unit}" if local_val is not None else "--"
+                remote_txt = f"{remote_val:.2f}{unit}" if remote_val is not None else "--"
+                label_widget.config(text=f"W:{local_txt} | M:{remote_txt}")
+            elif local_val is not None:
+                label_widget.config(text=f"{local_val:.2f}{unit}")
             else:
                 label_widget.config(text="0.0")
 
