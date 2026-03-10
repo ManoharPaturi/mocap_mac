@@ -1628,7 +1628,7 @@ class MocapGUI:
             
             # Update FPS label
             try:
-                self.fps_label.config(text=f"FPS: {fps:04.1f}")
+                self._enqueue_ui_task(self.fps_label.config, text=f"FPS: {fps:04.1f}")
             except: pass 
             
             # --- DUAL CAMERA DISPLAY (Master Mode) ---
