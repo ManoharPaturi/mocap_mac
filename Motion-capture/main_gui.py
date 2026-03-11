@@ -691,6 +691,14 @@ class MocapGUI:
                              width=18, bd=0, relief=tk.FLAT)
         help_btn.pack(side=tk.LEFT, padx=5)
 
+        if MULTI_CAMERA_MODE == 'master':
+            calib_btn = tk.Button(help_frame, text="🎯 ArUco Calibration",
+                                  command=self._start_recalibration,
+                                  font=("Arial", 11),
+                                  bg='#1a1a2e', fg='#ffa500',
+                                  width=20, bd=0, relief=tk.FLAT)
+            calib_btn.pack(side=tk.LEFT, padx=5)
+
         # Camera placement viewer (master mode)
         if MULTI_CAMERA_MODE == 'master':
             cam_viz_frame = tk.Frame(parent, bg='#0f0f1e')
@@ -1048,10 +1056,6 @@ class MocapGUI:
         except Exception:
             pass
 
-    def _launch_calibration_wizard(self):
-        """ArUco stereo calibration wizard — delegate to _start_recalibration."""
-        self._start_recalibration()
-
     def _show_camera_setup(self):
         """Show 3D camera placement viewer."""
         try:
@@ -1260,7 +1264,19 @@ class MocapGUI:
                         p3d_n = 0
                         kin_n = 0
                         pc1_ok = self._has_pose_payload(pc1)
-                        pc2_data = self._extract_pc2_pose_data(pc2)
+                        # Brute-force extraction from synced_batch for accurate remote trace.
+                        _remote_frame = next((f for f in (synced_batch or []) if getattr(f, 'camera_id', '') != 'local_cam'), None)
+                        _raw = []
+                        if _remote_frame:
+                            _res = getattr(_remote_frame, 'results', {})
+                            if isinstance(_res, dict):
+                                _raw = _res.get('packet_landmarks') or _res.get('landmarks') or _res.get('pose_landmarks') or []
+                            if not _raw:
+                                _raw = getattr(_remote_frame, 'packet_landmarks', getattr(_remote_frame, 'landmarks', getattr(_remote_frame, 'pose_landmarks', [])))
+                        if _raw and isinstance(_raw, list) and len(_raw) > 0 and isinstance(_raw[0], dict):
+                            pc2_data = [_raw]
+                        else:
+                            pc2_data = _raw if _raw else []
                         pc2_ok = len(pc2_data) > 0
                         if isinstance(pose_3d, dict):
                             p3d_n = len(pose_3d.get('pose_3d', {}) or {})
@@ -1273,7 +1289,7 @@ class MocapGUI:
                             f"pc1={'Y' if pc1_ok else 'N'} pc2={'Y' if pc2_ok else 'N'} "
                             f"pose3d_pts={p3d_n} kin_keys={kin_n} q={self._db_save_queue.qsize()}"
                         )
-                    self.db.save_synced_frame(ts, pc1, pc2, pose_3d)
+                    self.db.save_synced_frame(ts, pc1, pc2, pose_3d, synced_batch=synced_batch)
                     if self.coordinator and hasattr(self.coordinator, 'save_frame_to_database'):
                         self.coordinator.save_frame_to_database(synced_batch, pose_3d)
                 elif op == 'mono':
@@ -1409,37 +1425,71 @@ class MocapGUI:
                     })
 
                 if self.is_recording:
-                    # Normalize wrapped remote payload so DB serializer always
-                    # receives compact landmark keys at top level.
-                    if isinstance(pc2_res, dict):
-                        inner = pc2_res.get('results')
-                        if isinstance(inner, dict):
-                            normalized = dict(pc2_res)
-                            if 'landmarks' not in normalized and inner.get('landmarks') is not None:
-                                normalized['landmarks'] = inner.get('landmarks')
-                            if 'packet_landmarks' not in normalized and inner.get('packet_landmarks') is not None:
-                                normalized['packet_landmarks'] = inner.get('packet_landmarks')
-                            if 'pose_landmarks' not in normalized and inner.get('pose_landmarks') is not None:
-                                normalized['pose_landmarks'] = inner.get('pose_landmarks')
-                            pc2_res = normalized
+                    # 1. Isolate the remote frame from the batch
+                    remote_frame = next((f for f in synced_batch if getattr(f, 'camera_id', '') != 'local_cam'), None)
+                    raw_pc2 = []
+                    if remote_frame:
+                        # 2. Brute-force search: Check dictionary first
+                        res = getattr(remote_frame, 'results', {})
+                        if isinstance(res, dict):
+                            raw_pc2 = res.get('packet_landmarks') or res.get('landmarks') or res.get('pose_landmarks') or []
+                        # 3. Brute-force search: Check direct object attributes if dict was empty
+                        if not raw_pc2:
+                            raw_pc2 = getattr(remote_frame, 'packet_landmarks', getattr(remote_frame, 'landmarks', getattr(remote_frame, 'pose_landmarks', [])))
+
+                    # 4. Wrap it in a list of lists so MediaPipe/DB serializers register 1 person
+                    if raw_pc2 and isinstance(raw_pc2, list) and len(raw_pc2) > 0 and isinstance(raw_pc2[0], dict):
+                        pc2_data = [raw_pc2]
+                    else:
+                        pc2_data = raw_pc2 if raw_pc2 else []
+
+                    p2_pose_people = len(pc2_data)
+                    # Keep a normalized dict payload for downstream DB serializer compatibility.
+                    if p2_pose_people > 0:
+                        res = getattr(remote_frame, 'results', {}) if remote_frame else {}
+                        pc2_res = dict(res) if isinstance(res, dict) else {}
+                        pc2_res['packet_landmarks'] = raw_pc2
+                        pc2_res['pose_landmarks'] = pc2_data
+                    else:
+                        pc2_res = {}
 
                     self._save_trace['prequeue_synced'] += 1
                     if self._save_trace_enabled and self._save_trace['prequeue_synced'] % self._save_trace_every == 0:
                         p3d_n = 0
                         kin_n = 0
                         pc1_ok = self._has_pose_payload(pc1_res)
-                        pc2_data = self._extract_pc2_pose_data(pc2_res)
-                        pc2_ok = len(pc2_data) > 0
+                        pc2_ok = p2_pose_people > 0
+                        print(f"[DEBUG KEYS] cam_0 results keys: {list(pc2_res.keys()) if pc2_res else 'None'}")
+                        if pc2_res and ('packet_landmarks' in pc2_res or 'landmarks' in pc2_res):
+                            _dbg_val = pc2_res.get('packet_landmarks') or pc2_res.get('landmarks')
+                            print(f"[DEBUG DATA] Data type: {type(_dbg_val)}, length: {len(_dbg_val) if _dbg_val is not None else 'N/A'}")
                         if isinstance(pose_3d, dict):
                             p3d_n = len(pose_3d.get('pose_3d', {}) or {})
                             kin = pose_3d.get('kinematics_3d', {}) or {}
                             if isinstance(kin, dict):
                                 kin_n = len(kin.get('flat_export', {}) or {})
+                        # 1. Grab the remote frame
+                        remote_frame = next((f for f in synced_batch if getattr(f, 'camera_id', '') != 'local_cam'), None)
+                        # 2. Dump the raw object structure to the console (throttled to run once per batch)
+                        if remote_frame:
+                            try:
+                                # Get all attributes of the object
+                                frame_dump = vars(remote_frame)
+                                # Only print the keys and the types of their values to avoid terminal flood
+                                structure_dump = {k: type(v).__name__ for k, v in frame_dump.items()}
+                                print(f"🔥 RAW REMOTE FRAME STRUCTURE: {structure_dump}")
+
+                                # If 'results' exists, let's see exactly what's inside it
+                                if 'results' in frame_dump and isinstance(frame_dump['results'], dict):
+                                    print(f"🔥 RESULTS DICT KEYS: {list(frame_dump['results'].keys())}")
+
+                            except Exception as e:
+                                print(f"🔥 DUMP FAILED: {e}")
                         print(
                             f"[SaveTrace][PreQueue][synced] n={self._save_trace['prequeue_synced']} "
                             f"remote_id={remote_camera_id} batch={len(synced_batch)} "
                             f"pc1={'Y' if pc1_ok else 'N'} pc2={'Y' if pc2_ok else 'N'} "
-                            f"pose3d_pts={p3d_n} kin_keys={kin_n}"
+                            f"pose3d_pts={p3d_n} kin_keys={kin_n} p2_people={p2_pose_people}"
                         )
                     self._db_save_queue.put_nowait(
                         ('synced', time.time(), pc1_res, pc2_res, pose_3d, synced_batch)
@@ -1569,15 +1619,18 @@ class MocapGUI:
         if not isinstance(pc2_res, dict):
             return []
 
-        # 1. Try to get the data from any of the possible keys
-        raw_pc2_data = pc2_res.get('pose_landmarks') or pc2_res.get('landmarks') or pc2_res.get('packet_landmarks') or []
+        # 1. Extract the compact landmarks — packet_landmarks is the canonical Windows key
+        raw_pc2_data = pc2_res.get('packet_landmarks') or pc2_res.get('landmarks') or pc2_res.get('pose_landmarks') or []
 
-        # 2. Fix list nesting for compact flat payload
+        # 2. Force the correct MediaPipe nesting format
         if raw_pc2_data and isinstance(raw_pc2_data, list) and len(raw_pc2_data) > 0 and isinstance(raw_pc2_data[0], dict):
+            # Wrap the flat 33-joint list in an outer list so it counts as 1 person
             pc2_data = [raw_pc2_data]
         else:
             pc2_data = raw_pc2_data
 
+        # 3. Calculate people
+        p2_pose_people = len(pc2_data) if pc2_data else 0  # noqa: F841 (used by callers via return)
         return pc2_data if isinstance(pc2_data, list) else []
 
     def _has_pose_payload(self, results) -> bool:

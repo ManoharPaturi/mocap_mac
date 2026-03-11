@@ -651,24 +651,59 @@ class MocapDB:
         }
         self._enqueue_data(data)
 
-    def save_synced_frame(self, timestamp, pc1_results, pc2_results, pose_3d):
+    def save_synced_frame(self, timestamp, pc1_results, pc2_results, pose_3d, synced_batch=None):
         """Queue a synchronized multi-camera frame."""
         if not self.running or not self.session_id:
             return
+
+        # 1. Isolate the remote frame from the batch
+        remote_frame = next((f for f in (synced_batch or []) if getattr(f, 'camera_id', '') != 'local_cam'), None)
+        raw_pc2 = []
+        if remote_frame:
+            # 2. Brute-force search: Check dictionary first
+            res = getattr(remote_frame, 'results', {})
+            if isinstance(res, dict):
+                raw_pc2 = res.get('packet_landmarks') or res.get('landmarks') or res.get('pose_landmarks') or []
+
+            # 3. Brute-force search: Check direct object attributes if dict was empty
+            if not raw_pc2:
+                raw_pc2 = getattr(remote_frame, 'packet_landmarks', getattr(remote_frame, 'landmarks', getattr(remote_frame, 'pose_landmarks', [])))
+
+        # Fallback to explicit pc2_results when no synced-batch payload is available (e.g., mono path).
+        if not raw_pc2 and isinstance(pc2_results, dict):
+            raw_pc2 = pc2_results.get('packet_landmarks') or pc2_results.get('landmarks') or pc2_results.get('pose_landmarks') or []
+
+        # 4. Wrap it in a list of lists so MediaPipe/DB serializers register 1 person
+        if raw_pc2 and isinstance(raw_pc2, list) and len(raw_pc2) > 0 and isinstance(raw_pc2[0], dict):
+            pc2_data = [raw_pc2]
+        else:
+            pc2_data = raw_pc2 if raw_pc2 else []
+
+        p2_pose_people = len(pc2_data)
+        if p2_pose_people > 0:
+            base_res = getattr(remote_frame, 'results', {}) if remote_frame else {}
+            pc2_results_for_db = dict(base_res) if isinstance(base_res, dict) else {}
+            pc2_results_for_db['packet_landmarks'] = raw_pc2
+            pc2_results_for_db['pose_landmarks'] = pc2_data
+        else:
+            pc2_results_for_db = pc2_results if isinstance(pc2_results, dict) else {}
 
         def _extract_pc2_pose_data(pc2_res):
             if not isinstance(pc2_res, dict):
                 return []
 
-            # 1. Try to get the data from any of the possible keys
-            raw_pc2_data = pc2_res.get('pose_landmarks') or pc2_res.get('landmarks') or pc2_res.get('packet_landmarks') or []
+            # 1. Extract the compact landmarks — packet_landmarks is the canonical Windows key
+            raw_pc2_data = pc2_res.get('packet_landmarks') or pc2_res.get('landmarks') or pc2_res.get('pose_landmarks') or []
 
-            # 2. Fix the list nesting for compact payload
+            # 2. Force the correct MediaPipe nesting format
             if raw_pc2_data and isinstance(raw_pc2_data, list) and len(raw_pc2_data) > 0 and isinstance(raw_pc2_data[0], dict):
+                # Wrap the flat 33-joint list in an outer list so it counts as 1 person
                 pc2_data = [raw_pc2_data]
             else:
                 pc2_data = raw_pc2_data
 
+            # 3. Calculate people
+            p2_pose_people = len(pc2_data) if pc2_data else 0  # noqa: F841
             return pc2_data if isinstance(pc2_data, list) else []
 
         def _normalize_compact_pose_payload(results):
@@ -761,7 +796,7 @@ class MocapDB:
         p1_pose, p1_face, p1_hand, p1_derived = process_results(pc1_results, is_pc2=False)
         
         # PC2
-        p2_pose, p2_face, p2_hand, p2_derived = process_results(pc2_results, is_pc2=True)
+        p2_pose, p2_face, p2_hand, p2_derived = process_results(pc2_results_for_db, is_pc2=True)
         
         # 3D
         p3d_data = []
@@ -812,7 +847,7 @@ class MocapDB:
         self._save_trace_count += 1
         if self._save_trace_enabled and self._save_trace_count % self._save_trace_every == 0:
             # 3. Calculate people count
-            p2_people = len(_extract_pc2_pose_data(pc2_results))
+            p2_people = p2_pose_people
             print(
                 f"[SaveTrace][Payload] n={self._save_trace_count} "
                 f"p1_pose_people={len(p1_pose)} p2_pose_people={p2_people} "

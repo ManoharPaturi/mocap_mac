@@ -1,6 +1,6 @@
 # Multi-Camera Setup Guide
 
-Step-by-step instructions for running the VS5 Motion Capture System across **two PCs**.
+Step-by-step instructions for running the **VS7 Motion Capture System** across **two PCs**.
 
 ---
 
@@ -47,7 +47,7 @@ Matched Frame Pair
 2. Clone the repository:
    ```bash
    git clone https://github.com/Mrudula-itsjuzme/Motion-capture.git
-   cd Motion-capture/vs5
+   cd Motion-capture
    ```
 3. Create and activate virtual environment:
    ```powershell
@@ -67,7 +67,7 @@ Matched Frame Pair
 ### Network Requirements
 
 - Both PCs must be on the **same Wi-Fi network** (same subnet, e.g. `10.137.227.x`)
-- Ports **5000** (discovery) and **5001** (data) must be open on the **Server PC**
+- Ports **6000–6003** must be open on the **Server PC** (discovery, data, feedback, clock-sync)
 
 ---
 
@@ -97,9 +97,14 @@ Note down the IPv4 address from the **Wi-Fi** adapter. Example:
 On the **Server PC**, run **PowerShell as Administrator**:
 
 ```powershell
-New-NetFirewallRule -DisplayName "MoCap Port 5000" -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow
-New-NetFirewallRule -DisplayName "MoCap Port 5001" -Direction Inbound -LocalPort 5001 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Port 6000" -Direction Inbound -LocalPort 6000 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Port 6001" -Direction Inbound -LocalPort 6001 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Port 6002" -Direction Inbound -LocalPort 6002 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Port 6003" -Direction Inbound -LocalPort 6003 -Protocol TCP -Action Allow
 ```
+
+> **Note:** The old `allow_firewall.ps1` opened ports 5000–5001 (wrong). Re-run the updated script
+> (or use the commands above) to open ports 6000–6003.
 
 Or run the provided script:
 ```powershell
@@ -121,7 +126,7 @@ python launch_multi_camera.py --mode server
 You should see:
 ```
 [CameraServer] Initialized with ID: cam_0 on IP: 10.137.227.228
-[CameraServer] Started broadcasting on port 5000
+[CameraServer] Started broadcasting on port 6001
 [GUI] Camera Server started - broadcasting to network
 [SERVER] Queued frame 0
 [SERVER] Queued frame 1
@@ -190,10 +195,11 @@ If the remote feed shows **"NO DATA"** or **"WAITING"**, see Troubleshooting bel
 2. **Check the IP** — run `ipconfig` on both PCs, confirm same subnet
 3. **Check firewall** — run `scripts\allow_firewall.ps1` as Admin on Server PC
 
-### Port 5001 closed
+### Port 6001 or 6003 closed
 ```powershell
 # Run on Server PC as Admin
-New-NetFirewallRule -DisplayName "MoCap Data 5001" -Direction Inbound -LocalPort 5001 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Data 6001" -Direction Inbound -LocalPort 6001 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "MoCap Clock 6003" -Direction Inbound -LocalPort 6003 -Protocol TCP -Action Allow
 ```
 
 ### "Access Denied" on firewall

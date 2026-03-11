@@ -198,20 +198,34 @@ class StereoCalibration:
             marker_separation_m=marker_separation_m,
         )
 
-        marker_length_in = float(marker_length_m) / 0.0254
-        marker_separation_in = float(marker_separation_m) / 0.0254
-        board_w_in = board_width * marker_length_in + max(board_width - 1, 0) * marker_separation_in
-        board_h_in = board_height * marker_length_in + max(board_height - 1, 0) * marker_separation_in
+        # Compute canvas from integer pixel cell sizes so Python and OpenCV's
+        # internal C++ rounding always agree, preventing the Mat ROI assertion
+        # failure (matrix.cpp: roi.x + roi.width <= m.cols) seen in OpenCV 4.8+.
+        pixels_per_meter = float(dpi) / 0.0254
+        marker_px = max(10, int(float(marker_length_m) * pixels_per_meter))
+        sep_px    = max(2,  int(float(marker_separation_m) * pixels_per_meter))
+        margin_px = max(10, sep_px)
 
-        width_px = max(1000, int(round(board_w_in * dpi)))
-        height_px = max(1000, int(round(board_h_in * dpi)))
+        inner_w = int(board_width)  * marker_px + max(int(board_width)  - 1, 0) * sep_px
+        inner_h = int(board_height) * marker_px + max(int(board_height) - 1, 0) * sep_px
+        width_px  = inner_w + 2 * margin_px
+        height_px = inner_h + 2 * margin_px
 
-        if hasattr(board, 'generateImage'):
-            img = board.generateImage((width_px, height_px), marginSize=20, borderBits=1)
-        elif hasattr(board, 'draw'):
-            img = board.draw((width_px, height_px), marginSize=20, borderBits=1)
-        else:
+        def _gen(w, h, m):
+            if hasattr(board, 'generateImage'):
+                return board.generateImage((w, h), m, 1)
+            if hasattr(board, 'draw'):
+                return board.draw((w, h), m, 1)
             raise RuntimeError("OpenCV ArUco board image generation API unavailable.")
+
+        try:
+            img = _gen(width_px, height_px, margin_px)
+        except cv2.error:
+            # Last-resort fallback: generate into exact inner canvas with no
+            # margin, then pad with white border ourselves.
+            img = _gen(inner_w, inner_h, 0)
+            img = cv2.copyMakeBorder(img, margin_px, margin_px, margin_px, margin_px,
+                                     cv2.BORDER_CONSTANT, value=255)
 
         os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
         ok = cv2.imwrite(filepath, img)

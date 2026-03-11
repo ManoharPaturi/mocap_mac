@@ -55,3 +55,38 @@ Tracks architecture/documentation changes made in this repository.
     - `Pillow` (Tkinter image display path in `main_gui.py`)
     - `torch` (GPU/runtime checks and triangulation support)
     - `torchvision` (GPU JPEG decode helpers in `main_gui.py`)
+
+## 2026-03-10
+
+### Entry 006
+- **Scope:** Live video feed buffering elimination and async persistence.
+- **Source of truth:** `src/camera_server.py`, `main_gui.py`, `src/master_coordinator.py`.
+- **Changes made:**
+  - `camera_server.py`: `SNDHWM` → 1, `CONFLATE` → 1 (latest-only ZMQ transport).
+  - `camera_server.py`: face/hand/2D-pose landmark blobs stripped from packet; only compact 2D `landmarks` + `pose_world_landmarks` + JPEG transmitted.
+  - `camera_server.py`: `capture_timestamp_ns` (frame grab time) separated from `timestamp` (actual send time).
+  - `main_gui.py`: `_master_result_queue` maxsize reduced from 20 → 2.
+  - `main_gui.py`: async `_db_save_queue` + `_db_save_worker` thread added; SQLite saves decoupled from capture hot path.
+  - `main_gui.py`: `LiveVisualizer3D` and `Visualizer3D` removed from GUI startup (reduces RAM ~80–120 MB).
+  - `main_gui.py`: FPS label update moved off video thread to prevent cross-thread Tk access.
+  - `src/master_coordinator.py`: passive clock offset fallback, per-camera FPS tracking, adaptive sync threshold bounds (`SYNC_THRESHOLD_MIN_MS`, `SYNC_THRESHOLD_MAX_MS`).
+- **Notes:** These changes correspond to Session 4 in `CHANGES.md`.
+
+## 2026-03-11
+
+### Entry 007
+- **Scope:** Evaluation pipeline and research reporting infrastructure.
+- **Changes made:**
+  - Added `src/evaluation_pipeline.py` (`MotionCaptureEvaluationPipeline`):
+    - per-frame metrics CSV, aggregate JSON, evaluation_table.md.
+    - figures: `latency_kde.png`, `bone_variance_line.png`, `jitter_scatter.png`.
+    - ground-truth MPJPE support, calibration RMS tracking, epipolar error.
+  - Added `src/results_report.py` (`write_consolidated_results_report`):
+    - scans `results/session_*/evaluation/aggregate_metrics.json`.
+    - writes `results.md` at repo root with mean/P95/max table + figure embeds.
+  - Added `tools/generate_results_report.py`: standalone CLI regenerator.
+  - Added `wiretap.py`: ZMQ SUB packet inspector diagnostic.
+  - Added `check.py`: SQLite session table sanity checker.
+  - `SYSTEM_ARCHITECTURE.md` bumped to VS7.1.
+- **Notes:** Evaluation pipeline is wired into `main_gui.py` session lifecycle.
+

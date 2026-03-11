@@ -281,7 +281,9 @@ class CameraServer:
                 'capture_timestamp_ns': capture_timestamp_ns,
                 'calibration_id': CALIBRATION_ID,
                 'capture_fps': FPS,
-                'landmarks': self._build_stereo_packet_landmarks(results),
+                'results': {
+                    'packet_landmarks': self._build_stereo_packet_landmarks(results)
+                },
                 'frame_jpeg': frame_jpeg  # JPEG-encoded frame bytes
             }
             

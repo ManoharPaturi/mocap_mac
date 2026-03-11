@@ -37,6 +37,7 @@ from src.occlusion_fusion import OcclusionFusionEngine
 from src.uncertainty_estimation import UncertaintyEstimator, ErrorMetricsCalculator
 from src.advanced_kinematics import AdvancedKinematics
 from src.dashboard_monitoring import DashboardMonitor
+from src.evaluation_pipeline import MotionCaptureEvaluationPipeline
 from src.calculations import Calculations
 
 
@@ -136,6 +137,13 @@ class MasterCoordinator:
         )
         self.error_metrics_calculator = ErrorMetricsCalculator(window_size=300)
         self.dashboard_monitor = DashboardMonitor(history_size=300)
+        self.evaluator = MotionCaptureEvaluationPipeline(output_root='results', flush_every=60)
+        try:
+            if self.triangulator and getattr(self.triangulator, 'calibration', None):
+                self.evaluator.set_calibration(self.triangulator.calibration)
+            self.evaluator.set_ground_truth(os.environ.get('MOCAP_GT_PATH'))
+        except Exception:
+            pass
         
         # Clock synchronization
         self.clock_offsets: Dict[str, int] = {}  # camera_id -> offset in nanoseconds
@@ -266,6 +274,10 @@ class MasterCoordinator:
     def attach_database(self, db):
         """Attach MocapDB instance for layered persistence (optional)."""
         self.db = db
+        try:
+            self.evaluator.bind_database(db)
+        except Exception:
+            pass
 
     def reset_layer_frame_index(self):
         """Reset Layer-0 frame index at recording session start."""
@@ -359,6 +371,16 @@ class MasterCoordinator:
                             rms = float(rms_val)
                         except Exception:
                             rms = None
+                if rms is not None:
+                    print(f"[Calibration] RMS reprojection error (checkerboard/ChArUco): {rms:.4f}px")
+
+                # Explicit per-camera reprojection logging for research reporting.
+                for cam_id, cam in calibration.cameras.items():
+                    try:
+                        cam_rms = float(getattr(cam, 'reprojection_error', 0.0) or 0.0)
+                        print(f"[Calibration] {cam_id} reprojection error: {cam_rms:.4f}px")
+                    except Exception:
+                        pass
                 self.calibration_rms_px = rms
 
                 intrinsic_errors = [
@@ -476,6 +498,11 @@ class MasterCoordinator:
         
         for socket in self.data_sockets.values():
             socket.close()
+
+        try:
+            self.evaluator.finalize()
+        except Exception as e:
+            print(f"[MasterCoordinator] Evaluator finalize skipped: {e}")
         
         self.context.term()
         print("[MasterCoordinator] Stopped")
@@ -916,16 +943,28 @@ class MasterCoordinator:
                             print(f"[MasterCoordinator] ✅ Receiving data from {camera_id} (msg #{msg_count})")
 
                         if COMPRESS_NETWORK_DATA:
-                            msg = msgpack.unpackb(raw_data, raw=False)
+                            payload = msgpack.unpackb(raw_data, raw=False)
                         else:
-                            msg = json.loads(raw_data.decode('utf-8'))
+                            payload = json.loads(raw_data.decode('utf-8'))
 
-                        if msg.get('type') == 'frame_data':
-                            self._process_frame_data(msg)
+                        # payload is the raw dict received from ZMQ
+                        incoming_landmarks = payload.get('landmarks') or payload.get('packet_landmarks') or []
+                        incoming_results = payload.get('results', {})
+                        if not isinstance(incoming_results, dict):
+                            incoming_results = {}
+                        # Always merge root-level landmarks into results so downstream pipeline
+                        # sees packet_landmarks regardless of whether results had other keys.
+                        if incoming_landmarks and not incoming_results.get('packet_landmarks'):
+                            incoming_results['packet_landmarks'] = incoming_landmarks
+                        # Ensure downstream pipeline always reads normalized results from payload.
+                        payload['results'] = incoming_results
+
+                        if payload.get('type') == 'frame_data':
+                            self._process_frame_data(payload)
 
                         # Explicitly release per-message objects in hot receive loop.
                         try:
-                            del msg
+                            del payload
                         except Exception:
                             pass
                         try:
@@ -1013,9 +1052,24 @@ class MasterCoordinator:
         camera_id = msg.get('camera_id')
         frame_number = msg.get('frame_number')
         timestamp = msg.get('timestamp')
-        results = msg.get('results') or {}
-        if not isinstance(results, dict):
-            results = {}
+
+        # Bridge network payload variants into a canonical results dict.
+        # Some senders provide compact landmarks at root-level and leave
+        # 'results' empty/non-dict; normalize early so downstream pipeline sees data.
+        incoming_landmarks = msg.get('landmarks')
+        if incoming_landmarks is None:
+            incoming_landmarks = msg.get('packet_landmarks')
+
+        incoming_results = msg.get('results', {})
+        if not isinstance(incoming_results, dict):
+            incoming_results = {}
+
+        # Always merge root-level landmarks into results so packet_landmarks is
+        # present even when results already contains other keys (e.g. pose_world_landmarks).
+        if incoming_landmarks and not incoming_results.get('packet_landmarks'):
+            incoming_results['packet_landmarks'] = incoming_landmarks
+
+        results = incoming_results
 
         # Accept compact landmarks from both legacy and new payload layouts.
         # Some senders place landmarks at message root, others inside results.
@@ -1067,7 +1121,7 @@ class MasterCoordinator:
 
         # Low-latency priority: never enqueue very stale remote frames.
         # This prevents old capture timestamps from breaking sync matching.
-        ingress_stale_ms = 300.0
+        ingress_stale_ms = 800.0
         if camera_id != 'local_cam' and corrected_latency_ms > ingress_stale_ms:
             self.stats['frames_dropped_overflow'][camera_id] += 1
             if not hasattr(self, '_ingress_stale_drop_count'):
@@ -1767,6 +1821,16 @@ class MasterCoordinator:
                     self._occlusion_state[lm_id] = 'OCCLUDED'
 
         if not landmarks_3d:
+            try:
+                self.evaluator.record_frame(
+                    synced_frames=synced_frames,
+                    pose_3d={'pose_3d': {}, 'timestamp_ns': fused_timestamp_ns},
+                    latency_stats=self.get_latency_stats(),
+                    frames_received=dict(self.stats.get('frames_received', {})),
+                    sequence_gaps=dict(self._sequence_gaps),
+                )
+            except Exception as e:
+                print(f"[Evaluator] record_frame failed (empty pose): {e}")
             return None
             
         # ── Feedback loop ──
@@ -1844,7 +1908,7 @@ class MasterCoordinator:
         )
         advanced_kinematics = self.advanced_kinematics_engine.export_state_dict(advanced_state)
 
-        return {
+        output = {
             'pose_3d': landmarks_3d,
             'kinematics_3d': kinematics,
             'low_reliability_landmarks': sorted(set(low_reliability_landmarks)),
@@ -1866,6 +1930,19 @@ class MasterCoordinator:
             'advanced_kinematics': advanced_kinematics,
             'dashboard_status': self.dashboard_monitor.get_status()
         }
+
+        try:
+            self.evaluator.record_frame(
+                synced_frames=synced_frames,
+                pose_3d=output,
+                latency_stats=self.get_latency_stats(),
+                frames_received=dict(self.stats.get('frames_received', {})),
+                sequence_gaps=dict(self._sequence_gaps),
+            )
+        except Exception as e:
+            print(f"[Evaluator] record_frame failed: {e}")
+
+        return output
 
     def get_dashboard_status(self) -> Dict[str, Any]:
         """Expose consolidated dashboard monitoring status."""

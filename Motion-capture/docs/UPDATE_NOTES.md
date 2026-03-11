@@ -3,6 +3,20 @@
 Date: 2026-02-26
 System: Motion Capture Stereo Biomechanics Engine
 
+## Update - 2026-03-11 (Buffering + Evaluation Pipeline)
+
+See the root [`UPDATE_NOTES.md`](../UPDATE_NOTES.md) for full details. Summary:
+
+- Live video buffer buildup eliminated (ZMQ CONFLATE=1, SNDHWM=1, CAP_BUFFERSIZE=1).
+- Async DB save queue decouples SQLite writes from capture hot path.
+- `_master_result_queue` tightened to maxsize=2.
+- Network packet trimmed (face/hand/2D blobs removed; only compact landmarks + pose_world + JPEG).
+- `src/evaluation_pipeline.py` — per-frame metrics, aggregate JSON, figures.
+- `src/results_report.py` + `results.md` — consolidated results report.
+- `tools/generate_results_report.py` — standalone report regenerator.
+- `wiretap.py` and `check.py` diagnostics added.
+- `SYSTEM_ARCHITECTURE.md` bumped to VS7.1.
+
 ## Update - 2026-02-27 (Dual-Camera Persistence & Dashboard)
 
 - Added dual-stream metric computation/state handling in master mode (local + remote camera streams).

@@ -1,4 +1,4 @@
-# Stereo Coordinate & Kinematics Convention (VS2)
+# Stereo Coordinate & Kinematics Convention (VS7 — updated 11 March 2026)
 
 This project now uses a locked, right-handed world coordinate convention.
 
@@ -86,7 +86,11 @@ Interpretation:
 - Known-angle test (e.g., 90° elbow): compare measured `Angle_Elbow_R/L`
 - Known-distance test (e.g., 1m depth check): compare triangulated `Z` against physical distance
 
-# VS5 Motion Capture - Multi-Camera Enhanced Edition
+# VS7 Motion Capture — Multi-Camera Stereo Edition
+
+> **Version**: VS7.1 (11 March 2026) — real-time buffering fix, async DB writes,
+> evaluation pipeline, trimmed network packet.
+> See [SYSTEM_ARCHITECTURE.md](SYSTEM_ARCHITECTURE.md) and [CHANGES.md](CHANGES.md) for full history.
 
 Real-time multi-person pose, face, and hand tracking with **dual-laptop stereo 3D reconstruction**.
 
@@ -269,12 +273,12 @@ Features:
 ### Architecture
 
 ```
-Laptop 1 (Server)         Laptop 2 (Master + Server)
-─────────────────         ─────────────────────────
+Laptop 1 (Server)         Laptop 2 (Master)
+─────────────────         ─────────────────
 Camera → Detector    →    MasterCoordinator
      ↓                         ↓
 CameraServer         →    FrameSynchronizer
-(Port 5000-5001)              ↓
+(Ports 6000–6003)              ↓
                           Triangulator
                               ↓
                           Unified 3D Pose
